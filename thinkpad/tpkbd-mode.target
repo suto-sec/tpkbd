@@ -1,0 +1,5 @@
+[Unit]
+Description=ThinkPad as PC keyboard (tpkbd)
+Requires=multi-user.target
+After=multi-user.target
+AllowIsolate=yes

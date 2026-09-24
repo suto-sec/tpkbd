@@ -1,0 +1,2 @@
+# append to ~/.ssh/authorized_keys on the PC, with the real public key
+from="192.168.1.0/24",restrict,pty,command="stty -echo; exec /usr/local/bin/tpkbd-recv" ssh-ed25519 AAAA... tpkbd

@@ -1,0 +1,16 @@
+[Unit]
+Description=tpkbd: forward ThinkPad keyboard, TrackPoint and touchpad to the PC
+Wants=network-online.target
+After=network-online.target display-manager.service getty@tty1.service
+StartLimitIntervalSec=0
+
+[Service]
+ExecStartPre=/usr/local/bin/tpkbd-screen off
+ExecStart=/usr/local/bin/tpkbd-send
+ExecStopPost=/usr/local/bin/tpkbd-screen post
+Restart=always
+RestartSec=3
+RestartPreventExitStatus=42
+
+[Install]
+WantedBy=tpkbd-mode.target

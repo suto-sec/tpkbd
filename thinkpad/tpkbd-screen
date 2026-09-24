@@ -1,0 +1,36 @@
+#!/bin/sh
+# tpkbd-screen off|post: power the internal panel off in keyboard mode.
+# "post" only restores it after Ctrl+Ctrl+Esc (42) or a shutdown, not on retries.
+SAVE=/run/tpkbd-brightness
+
+restore() {
+    for s in /sys/class/drm/card*-eDP-*/status; do
+        [ -e "$s" ] && echo detect > "$s"
+    done
+    sleep 1
+    for b in /sys/class/backlight/*; do
+        if [ -f "$SAVE" ]; then cat "$SAVE" > "$b/brightness"
+        else cat "$b/max_brightness" > "$b/brightness"; fi
+    done
+    rm -f "$SAVE"
+}
+
+case "$1" in
+off)
+    sleep 2
+    chvt 1
+    for b in /sys/class/backlight/*; do
+        [ -f "$SAVE" ] || cat "$b/brightness" > "$SAVE"
+        echo 0 > "$b/brightness"
+    done
+    for s in /sys/class/drm/card*-eDP-*/status; do
+        [ -e "$s" ] && echo off > "$s"
+    done
+    ;;
+post)
+    case "$EXIT_STATUS" in
+        42|TERM|INT) restore ;;
+    esac
+    ;;
+esac
+exit 0
