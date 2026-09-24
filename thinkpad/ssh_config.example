@@ -1,0 +1,9 @@
+# copy to /etc/tpkbd/ssh_config (chmod 600) and fill in HostName and User
+Host tpkbd-pc
+    HostName 192.168.1.X
+    User your-user
+    IdentityFile /etc/tpkbd/id_ed25519
+    IdentitiesOnly yes
+    UserKnownHostsFile /etc/tpkbd/known_hosts
+    HostKeyAlias tpkbd-pc
+    StrictHostKeyChecking yes

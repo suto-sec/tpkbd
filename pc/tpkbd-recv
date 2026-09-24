@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+# tpkbd-recv: replay input from tpkbd-send through uinput devices.
+# Started by the forced command in ~/.ssh/authorized_keys.
+import collections
+import sys
+import time
+
+from evdev import AbsInfo, UInput, ecodes as e
+
+SCALE = 1.25        # PC width in px / ThinkPad logical width (1920 / 1536)
+JITTER_MS = 15      # replay delay used to smooth out Wi-Fi jitter
+WINDOW_S = 2.0
+BUS_I8042 = 0x11
+
+kbd_keys = list(range(1, 0x100)) + list(range(0x160, 0x2ff))  # skip BTN_* range
+kbd = UInput({e.EV_KEY: kbd_keys}, name="ThinkPad remote keyboard", bustype=BUS_I8042)
+
+ptr = UInput(
+    {e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
+     e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL, e.REL_HWHEEL,
+                e.REL_WHEEL_HI_RES, e.REL_HWHEEL_HI_RES]},
+    name="ThinkPad remote pointer",
+)
+
+# touchpad used only to synthesize pinches: 100x65 mm, 40 units/mm
+RES, W, H = 40, 4000, 2600
+CX, CY, HALF0 = W // 2, H // 2, 400
+pinch = UInput(
+    {e.EV_KEY: [e.BTN_LEFT, e.BTN_TOUCH, e.BTN_TOOL_FINGER, e.BTN_TOOL_DOUBLETAP],
+     e.EV_ABS: [(e.ABS_X, AbsInfo(0, 0, W, 0, 0, RES)),
+                (e.ABS_Y, AbsInfo(0, 0, H, 0, 0, RES)),
+                (e.ABS_MT_SLOT, AbsInfo(0, 0, 1, 0, 0, 0)),
+                (e.ABS_MT_TRACKING_ID, AbsInfo(0, 0, 65535, 0, 0, 0)),
+                (e.ABS_MT_POSITION_X, AbsInfo(0, 0, W, 0, 0, RES)),
+                (e.ABS_MT_POSITION_Y, AbsInfo(0, 0, H, 0, 0, RES))]},
+    name="ThinkPad remote pinch",
+    input_props=[e.INPUT_PROP_POINTER, e.INPUT_PROP_BUTTONPAD],
+)
+touch_id = 0
+pinching = False
+
+
+def fingers(half):
+    half = max(20, min(int(half), CX - 50))
+    for slot, x in ((0, CX - half), (1, CX + half)):
+        pinch.write(e.EV_ABS, e.ABS_MT_SLOT, slot)
+        pinch.write(e.EV_ABS, e.ABS_MT_POSITION_X, x)
+    pinch.write(e.EV_ABS, e.ABS_X, CX - half)
+
+
+time.sleep(0.5)  # let the compositor pick up the new devices
+print("READY", flush=True)
+
+recent = collections.deque()
+jitter = JITTER_MS / 1000
+
+
+def pace(sent_us):
+    # keep the original spacing, JITTER_MS behind the fastest recent delivery
+    now = time.time()
+    sent = sent_us / 1_000_000
+    recent.append((now, now - sent))
+    while recent[0][0] < now - WINDOW_S:
+        recent.popleft()
+    wait = sent + min(d for _, d in recent) + jitter - time.time()
+    if 0 < wait < 0.2:
+        time.sleep(wait)
+
+
+rem_x = rem_y = 0.0
+rem_v = rem_h = 0.0
+acc_v = acc_h = 0
+kbd_pending = []
+
+for line in sys.stdin:
+    p = line.split()
+    if len(p) != 4:
+        continue
+    try:
+        tag = p[0]
+        if tag not in ("k", "m", "b", "s", "g"):
+            continue
+        if tag == "k":
+            t, c, v = int(p[1]), int(p[2]), int(p[3])
+            if t != e.EV_SYN:
+                kbd_pending.append((t, c, v))
+                continue
+            pace(v)
+            for t, c, val in kbd_pending:
+                kbd.write(t, c, val)
+            kbd.syn()
+            kbd_pending.clear()
+
+        elif tag == "m":
+            pace(int(p[3]))
+            rem_x += float(p[1]) * SCALE
+            rem_y += float(p[2]) * SCALE
+            dx, dy = int(rem_x), int(rem_y)
+            rem_x -= dx
+            rem_y -= dy
+            if dx or dy:
+                if dx:
+                    ptr.write(e.EV_REL, e.REL_X, dx)
+                if dy:
+                    ptr.write(e.EV_REL, e.REL_Y, dy)
+                ptr.syn()
+
+        elif tag == "b":
+            pace(int(p[3]))
+            ptr.write(e.EV_KEY, int(p[1]), int(p[2]))
+            ptr.syn()
+
+        elif tag == "s":
+            pace(int(p[3]))
+            # libinput: 15 units per wheel click (= 120 hi-res), positive is down
+            rem_v += -float(p[1]) * 8
+            rem_h += float(p[2]) * 8
+            hv, hh = int(rem_v), int(rem_h)
+            rem_v -= hv
+            rem_h -= hh
+            if hv:
+                ptr.write(e.EV_REL, e.REL_WHEEL_HI_RES, hv)
+                acc_v += hv
+                if abs(acc_v) >= 120:
+                    ptr.write(e.EV_REL, e.REL_WHEEL, int(acc_v / 120))
+                    acc_v -= int(acc_v / 120) * 120
+            if hh:
+                ptr.write(e.EV_REL, e.REL_HWHEEL_HI_RES, hh)
+                acc_h += hh
+                if abs(acc_h) >= 120:
+                    ptr.write(e.EV_REL, e.REL_HWHEEL, int(acc_h / 120))
+                    acc_h -= int(acc_h / 120) * 120
+            if hv or hh:
+                ptr.syn()
+
+        elif tag == "g":
+            pace(int(p[3]))
+            if p[1] == "b" and not pinching:
+                for slot, x in ((0, CX - HALF0), (1, CX + HALF0)):
+                    touch_id = (touch_id + 1) % 65536
+                    pinch.write(e.EV_ABS, e.ABS_MT_SLOT, slot)
+                    pinch.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, touch_id)
+                    pinch.write(e.EV_ABS, e.ABS_MT_POSITION_X, x)
+                    pinch.write(e.EV_ABS, e.ABS_MT_POSITION_Y, CY)
+                pinch.write(e.EV_ABS, e.ABS_X, CX - HALF0)
+                pinch.write(e.EV_ABS, e.ABS_Y, CY)
+                pinch.write(e.EV_KEY, e.BTN_TOUCH, 1)
+                pinch.write(e.EV_KEY, e.BTN_TOOL_DOUBLETAP, 1)
+                pinch.syn()
+                pinching = True
+            elif p[1] == "u" and pinching:
+                fingers(HALF0 * float(p[2]))
+                pinch.syn()
+            elif p[1] == "e" and pinching:
+                for slot in (0, 1):
+                    pinch.write(e.EV_ABS, e.ABS_MT_SLOT, slot)
+                    pinch.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
+                pinch.write(e.EV_KEY, e.BTN_TOUCH, 0)
+                pinch.write(e.EV_KEY, e.BTN_TOOL_DOUBLETAP, 0)
+                pinch.syn()
+                pinching = False
+    except (ValueError, OSError):
+        continue

@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+# tpkbd-send: forward the ThinkPad's keyboard, TrackPoint and touchpad to the PC.
+# Run as root. Hold both Ctrl keys and press Esc to stop (exit code 42).
+import os
+import pty
+import re
+import select
+import subprocess
+import sys
+import time
+
+import evdev
+from evdev import ecodes as e
+
+SSH_CONFIG = "/etc/tpkbd/ssh_config"
+HOST = "tpkbd-pc"
+READY_TIMEOUT = 15
+
+KEYBOARD = ["AT Translated Set 2 keyboard", "ThinkPad Extra Buttons"]
+POINTING = ["TrackPoint", "Synaptics TM3276"]
+
+LIBINPUT_OPTS = ["--set-profile=adaptive", "--set-speed=0",
+                 "--enable-tap", "--disable-dwt"]
+
+ESCAPE = {e.KEY_LEFTCTRL, e.KEY_RIGHTCTRL, e.KEY_ESC}
+
+# libinput debug-events output. Repeated events get a counter column before
+# the timestamp, so that part is optional.
+TS = r"\s+(?:\d+\s+)?[+-]?\d+\.\d+s\s+"
+RE_MOTION = re.compile(r"POINTER_MOTION" + TS + r"(-?\d+\.\d+)/\s*(-?\d+\.\d+)")
+RE_BUTTON = re.compile(r"POINTER_BUTTON" + TS + r"\S+ \((\d+)\) (pressed|released)")
+RE_SCROLL = re.compile(r"POINTER_SCROLL_(?:FINGER|CONTINUOUS)" + TS +
+                       r"vert (-?\d+\.\d+)/\S+ horiz (-?\d+\.\d+)/")
+RE_PINCH_UPDATE = re.compile(r"GESTURE_PINCH_UPDATE.*unaccelerated\)\s+(-?\d+\.\d+) @")
+
+
+def log(msg):
+    print(f"tpkbd: {msg}", flush=True)
+
+
+def find(names):
+    found = []
+    for path in evdev.list_devices():
+        d = evdev.InputDevice(path)
+        if any(n in d.name for n in names):
+            found.append(d)
+        else:
+            d.close()
+    return found
+
+
+def now_us():
+    return int(time.time() * 1_000_000)
+
+
+kbds = find(KEYBOARD)
+pointing = find(POINTING)
+if not kbds or not pointing:
+    sys.exit(f"missing devices: keyboard={[d.name for d in kbds]} "
+             f"pointing={[d.name for d in pointing]}")
+pointing_paths = [d.path for d in pointing]
+for d in pointing:
+    d.close()
+
+log("connecting to the PC...")
+t0 = time.monotonic()
+
+# -tt: with a pty, ssh sets TCP_NODELAY, otherwise small writes get delayed
+ssh = subprocess.Popen(
+    ["ssh", "-F", SSH_CONFIG, "-tt", "-e", "none",
+     "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+     "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+     HOST],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+
+
+def send(lines):
+    try:
+        ssh.stdin.write("\n".join(lines) + "\n")
+        ssh.stdin.flush()
+    except (BrokenPipeError, OSError):
+        pass
+
+
+# don't grab anything until the receiver has created its devices
+deadline = time.monotonic() + READY_TIMEOUT
+while True:
+    left = deadline - time.monotonic()
+    if left <= 0 or ssh.poll() is not None:
+        ssh.terminate()
+        sys.exit("tpkbd: PC not reachable or receiver not ready (will retry)")
+    r, _, _ = select.select([ssh.stdout], [], [], left)
+    if r and ssh.stdout.readline().strip() == "READY":
+        break
+
+# libinput on a pty so its output isn't buffered
+master, slave = pty.openpty()
+dev_args = [arg for p in pointing_paths for arg in ("--device", p)]
+li = subprocess.Popen(["libinput", "debug-events", "--grab", *dev_args, *LIBINPUT_OPTS],
+                      stdin=subprocess.DEVNULL, stdout=slave, stderr=subprocess.DEVNULL)
+os.close(slave)
+
+for d in kbds:
+    d.grab()
+kbd_fds = {d.fd: d for d in kbds}
+pending = []
+held = set()
+li_buf = b""
+
+log(f"CONNECTED after {time.monotonic() - t0:.1f} s (hold both Ctrl + Esc to stop)")
+
+try:
+    while True:
+        ready, _, _ = select.select([*kbd_fds, master], [], [], 1.0)
+        for fd in ready:
+            if fd == master:
+                try:
+                    li_buf += os.read(master, 4096)
+                except OSError:
+                    log("libinput stopped")
+                    sys.exit(1)
+                *lines, li_buf = li_buf.split(b"\n")
+                out = []
+                for raw in lines:
+                    line = raw.decode(errors="replace")
+                    if "GESTURE_PINCH_BEGIN" in line:
+                        out.append(f"g b 1 {now_us()}")
+                    elif m := RE_PINCH_UPDATE.search(line):
+                        out.append(f"g u {m[1]} {now_us()}")
+                    elif "GESTURE_PINCH_END" in line:
+                        out.append(f"g e 1 {now_us()}")
+                    elif m := RE_MOTION.search(line):
+                        out.append(f"m {m[1]} {m[2]} {now_us()}")
+                    elif m := RE_BUTTON.search(line):
+                        out.append(f"b {m[1]} {1 if m[2] == 'pressed' else 0} {now_us()}")
+                    elif m := RE_SCROLL.search(line):
+                        out.append(f"s {m[1]} {m[2]} {now_us()}")
+                if out:
+                    send(out)
+                continue
+            for ev in kbd_fds[fd].read():
+                if ev.type == e.EV_SYN:
+                    if ev.code == e.SYN_REPORT and pending:
+                        pending.append(f"k 0 0 {ev.sec * 1_000_000 + ev.usec}")
+                        send(pending)
+                        pending.clear()
+                elif ev.type == e.EV_KEY and ev.value != 2:  # the PC does its own key repeat
+                    (held.add if ev.value else held.discard)(ev.code)
+                    if ESCAPE <= held:
+                        log("stopped (Ctrl+Ctrl+Esc)")
+                        sys.exit(42)
+                    pending.append(f"k {ev.type} {ev.code} {ev.value}")
+        if ssh.poll() is not None:
+            log("connection lost")
+            sys.exit(1)
+        if li.poll() is not None:
+            log("libinput stopped")
+            sys.exit(1)
+finally:
+    for d in kbds:
+        try:
+            d.ungrab()
+        except OSError:
+            pass
+    li.terminate()
+    ssh.terminate()
