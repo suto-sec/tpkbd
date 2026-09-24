@@ -30,12 +30,14 @@ On the PC, the SSH key is restricted in `authorized_keys` to a single forced com
 
 ```
 thinkpad/
+  install.sh               installer, run with sudo
   tpkbd-send               sender (Python, runs as root)
   tpkbd-screen             panel off/on helper
   tpkbd-forward.service    systemd service
   tpkbd-mode.target        "keyboard mode" target
   ssh_config.example       goes to /etc/tpkbd/ssh_config
 pc/
+  install.sh               installer, run with sudo
   tpkbd-recv               receiver (Python)
   60-tpkbd-uinput.rules    udev rule for /dev/uinput
   tpkbd-uinput.conf        loads the uinput module at boot
@@ -52,21 +54,26 @@ docs/
 - PC: `python-evdev`, an SSH server, KDE Plasma on Wayland (X11 works too, but pinch support there depends on the app)
 - Both on the same network
 
-## Setup (short version)
+## Setup
 
-The full walkthrough is in [docs/setup.md](docs/setup.md). Roughly:
+Each side has an installer that handles the file copying, permissions, udev rule and systemd unit:
+
+```bash
+# PC
+sudo pc/install.sh
+
+# ThinkPad
+sudo thinkpad/install.sh
+```
+
+They can't do everything: SSH key exchange, the receiver's IP/user, and a couple of GUI-only settings still need a manual step, which the installers print at the end. The full walkthrough, including what to do if something doesn't work, is in [docs/setup.md](docs/setup.md). Roughly, after running both installers:
 
 **PC**
-1. Create a `uinput` group, add your user to it, install the udev rule and the module config.
-2. Install `tpkbd-recv` to `/usr/local/bin/`.
-3. Add the ThinkPad's public key to `~/.ssh/authorized_keys` using the line in `authorized_keys.example`.
-4. In KDE settings, set pointer acceleration to "None" for *ThinkPad remote pointer* and disable tap-to-click for *ThinkPad remote pinch*.
+1. Add the ThinkPad's public key to `~/.ssh/authorized_keys` using the line in `authorized_keys.example` (the installer prints the key).
+2. In KDE settings, set pointer acceleration to "None" for *ThinkPad remote pointer* and disable tap-to-click for *ThinkPad remote pinch*.
 
 **ThinkPad**
-1. Generate a key in `/etc/tpkbd/`, copy `ssh_config.example` to `/etc/tpkbd/ssh_config` and fill in the PC's address and user.
-2. Install `tpkbd-send` and `tpkbd-screen` to `/usr/local/bin/`.
-3. Install the service and target to `/etc/systemd/system/`, then `systemctl daemon-reload` and `systemctl enable tpkbd-forward.service`.
-4. Make the Wi-Fi connection available system-wide (no KWallet) and turn off Wi-Fi power saving.
+1. Make the Wi-Fi connection available system-wide (no KWallet) and turn off Wi-Fi power saving.
 
 ## Usage
 
