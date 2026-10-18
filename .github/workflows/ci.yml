@@ -1,0 +1,20 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck pc/install.sh pc/uninstall.sh thinkpad/install.sh thinkpad/uninstall.sh thinkpad/tpkbd-screen
+      - name: compile the scripts
+        run: python3 -m py_compile pc/tpkbd-recv thinkpad/tpkbd-send thinkpad/tpkbd-pair
+      - name: tests
+        run: python3 -m unittest discover -s tests -t .
