@@ -18,5 +18,7 @@
 # keys that are never forwarded (Fn+4 would otherwise suspend the PC)
 # block_keys = KEY_SLEEP KEY_SUSPEND KEY_WAKEUP KEY_POWER
 
-# this chord stops keyboard mode
+# keyboard mode: this chord stops it
 # escape_keys = KEY_LEFTCTRL KEY_RIGHTCTRL KEY_ESC
+# soft mode: this chord switches between this laptop and the PC
+# toggle_keys = KEY_LEFTCTRL KEY_RIGHTCTRL KEY_SPACE
