@@ -1,163 +1,288 @@
 #!/usr/bin/env python3
 # tpkbd-recv: replay input from tpkbd-send through uinput devices.
 # Started by the forced command in ~/.ssh/authorized_keys.
+# Settings (optional): ~/.config/tpkbd/recv.conf, see pc/recv.conf.example.
 import collections
+import configparser
+import os
+import select
 import sys
 import time
 
 from evdev import AbsInfo, UInput, ecodes as e
 
-SCALE = 1.25        # PC width in px / ThinkPad logical width (1920 / 1536)
-JITTER_MS = 15      # replay delay used to smooth out Wi-Fi jitter
+PROTO = 2                       # must match tpkbd-send
+CONF_PATH = os.path.expanduser("~/.config/tpkbd/recv.conf")
+
+DEFAULTS = {
+    "scale": "1.25",        # PC width in px / ThinkPad logical width (1920 / 1536)
+    "jitter_ms": "15",      # replay delay used to smooth out Wi-Fi jitter
+    "half0": "400",         # half the starting finger distance for pinches (40 units/mm)
+    "watchdog_s": "3",      # silence this long: release every key and button
+    "dead_s": "30",         # silence this long: the sender is gone, exit
+}
+
 WINDOW_S = 2.0
 BUS_I8042 = 0x11
 
-kbd_keys = list(range(1, 0x100)) + list(range(0x160, 0x2ff))  # skip BTN_* range
-kbd = UInput({e.EV_KEY: kbd_keys}, name="ThinkPad remote keyboard", bustype=BUS_I8042)
-
-ptr = UInput(
-    {e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
-     e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL, e.REL_HWHEEL,
-                e.REL_WHEEL_HI_RES, e.REL_HWHEEL_HI_RES]},
-    name="ThinkPad remote pointer",
-)
-
 # touchpad used only to synthesize pinches: 100x65 mm, 40 units/mm
 RES, W, H = 40, 4000, 2600
-CX, CY, HALF0 = W // 2, H // 2, 400
-pinch = UInput(
-    {e.EV_KEY: [e.BTN_LEFT, e.BTN_TOUCH, e.BTN_TOOL_FINGER, e.BTN_TOOL_DOUBLETAP],
-     e.EV_ABS: [(e.ABS_X, AbsInfo(0, 0, W, 0, 0, RES)),
-                (e.ABS_Y, AbsInfo(0, 0, H, 0, 0, RES)),
-                (e.ABS_MT_SLOT, AbsInfo(0, 0, 1, 0, 0, 0)),
-                (e.ABS_MT_TRACKING_ID, AbsInfo(0, 0, 65535, 0, 0, 0)),
-                (e.ABS_MT_POSITION_X, AbsInfo(0, 0, W, 0, 0, RES)),
-                (e.ABS_MT_POSITION_Y, AbsInfo(0, 0, H, 0, 0, RES))]},
-    name="ThinkPad remote pinch",
-    input_props=[e.INPUT_PROP_POINTER, e.INPUT_PROP_BUTTONPAD],
-)
-touch_id = 0
-pinching = False
+CX, CY = W // 2, H // 2
+MIN_HALF, MAX_HALF = 20, CX - 50
 
 
-def fingers(half):
-    half = max(20, min(int(half), CX - 50))
-    for slot, x in ((0, CX - half), (1, CX + half)):
-        pinch.write(e.EV_ABS, e.ABS_MT_SLOT, slot)
-        pinch.write(e.EV_ABS, e.ABS_MT_POSITION_X, x)
-    pinch.write(e.EV_ABS, e.ABS_X, CX - half)
+def say(msg):
+    print(f"tpkbd-recv: {msg}", file=sys.stderr, flush=True)
 
 
-time.sleep(0.5)  # let the compositor pick up the new devices
-print("READY", flush=True)
-
-recent = collections.deque()
-jitter = JITTER_MS / 1000
-
-
-def pace(sent_us):
-    # keep the original spacing, JITTER_MS behind the fastest recent delivery
-    now = time.time()
-    sent = sent_us / 1_000_000
-    recent.append((now, now - sent))
-    while recent[0][0] < now - WINDOW_S:
-        recent.popleft()
-    wait = sent + min(d for _, d in recent) + jitter - time.time()
-    if 0 < wait < 0.2:
-        time.sleep(wait)
+def load_config(path=CONF_PATH):
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.read_dict({"receiver": DEFAULTS})
+    cp.read(path)  # a missing file just means defaults
+    s = cp["receiver"]
+    return {k: float(s[k]) for k in DEFAULTS}
 
 
-rem_x = rem_y = 0.0
-rem_v = rem_h = 0.0
-acc_v = acc_h = 0
-kbd_pending = []
+def make_devices():
+    kbd_keys = list(range(1, 0x100)) + list(range(0x160, 0x2ff))  # skip BTN_* range
+    kbd = UInput({e.EV_KEY: kbd_keys}, name="ThinkPad remote keyboard", bustype=BUS_I8042)
+    ptr = UInput(
+        {e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
+         e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL, e.REL_HWHEEL,
+                    e.REL_WHEEL_HI_RES, e.REL_HWHEEL_HI_RES]},
+        name="ThinkPad remote pointer",
+    )
+    pinch = UInput(
+        {e.EV_KEY: [e.BTN_LEFT, e.BTN_TOUCH, e.BTN_TOOL_FINGER, e.BTN_TOOL_DOUBLETAP],
+         e.EV_ABS: [(e.ABS_X, AbsInfo(0, 0, W, 0, 0, RES)),
+                    (e.ABS_Y, AbsInfo(0, 0, H, 0, 0, RES)),
+                    (e.ABS_MT_SLOT, AbsInfo(0, 0, 1, 0, 0, 0)),
+                    (e.ABS_MT_TRACKING_ID, AbsInfo(0, 0, 65535, 0, 0, 0)),
+                    (e.ABS_MT_POSITION_X, AbsInfo(0, 0, W, 0, 0, RES)),
+                    (e.ABS_MT_POSITION_Y, AbsInfo(0, 0, H, 0, 0, RES))]},
+        name="ThinkPad remote pinch",
+        input_props=[e.INPUT_PROP_POINTER, e.INPUT_PROP_BUTTONPAD],
+    )
+    return kbd, ptr, pinch
 
-for line in sys.stdin:
-    p = line.split()
-    if len(p) != 4:
-        continue
-    try:
+
+class Replayer:
+    def __init__(self, kbd, ptr, pinch, cfg, clock=time.time, sleep=time.sleep):
+        self.kbd, self.ptr, self.pinch = kbd, ptr, pinch
+        self.scale = cfg["scale"]
+        self.jitter = cfg["jitter_ms"] / 1000
+        self.half0 = int(cfg["half0"])
+        self.clock, self.sleep = clock, sleep
+        self.recent = collections.deque()
+        self.rem_x = self.rem_y = 0.0
+        self.rem_v = self.rem_h = 0.0
+        self.acc_v = self.acc_h = 0
+        self.kbd_pending = []
+        self.keys_down = set()
+        self.buttons_down = set()
+        self.touch_id = 0
+        self.pinching = False
+        self.pinch_base = 1.0
+        self.write_errors = 0
+
+    def pace(self, sent_us):
+        # keep the original spacing, `jitter` behind the fastest recent delivery
+        now = self.clock()
+        sent = sent_us / 1_000_000
+        self.recent.append((now, now - sent))
+        while self.recent[0][0] < now - WINDOW_S:
+            self.recent.popleft()
+        wait = sent + min(d for _, d in self.recent) + self.jitter - self.clock()
+        if 0 < wait < 0.2:
+            self.sleep(wait)
+
+    # keys and buttons
+
+    def release_all(self):
+        """Let go of everything: used when the sender goes quiet or disconnects."""
+        self.kbd_pending.clear()
+        try:
+            if self.keys_down:
+                for code in sorted(self.keys_down):
+                    self.kbd.write(e.EV_KEY, code, 0)
+                self.kbd.syn()
+            if self.buttons_down:
+                for code in sorted(self.buttons_down):
+                    self.ptr.write(e.EV_KEY, code, 0)
+                self.ptr.syn()
+            if self.pinching:
+                self.pinch_end()
+        except OSError as err:
+            say(f"release failed: {err}")
+        self.keys_down.clear()
+        self.buttons_down.clear()
+
+    # pinch
+
+    def fingers(self, half):
+        half = max(MIN_HALF, min(int(half), MAX_HALF))
+        for slot, x in ((0, CX - half), (1, CX + half)):
+            self.pinch.write(e.EV_ABS, e.ABS_MT_SLOT, slot)
+            self.pinch.write(e.EV_ABS, e.ABS_MT_POSITION_X, x)
+        self.pinch.write(e.EV_ABS, e.ABS_X, CX - half)
+
+    def pinch_begin(self):
+        for slot, x in ((0, CX - self.half0), (1, CX + self.half0)):
+            self.touch_id = (self.touch_id + 1) % 65536
+            self.pinch.write(e.EV_ABS, e.ABS_MT_SLOT, slot)
+            self.pinch.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, self.touch_id)
+            self.pinch.write(e.EV_ABS, e.ABS_MT_POSITION_X, x)
+            self.pinch.write(e.EV_ABS, e.ABS_MT_POSITION_Y, CY)
+        self.pinch.write(e.EV_ABS, e.ABS_X, CX - self.half0)
+        self.pinch.write(e.EV_ABS, e.ABS_Y, CY)
+        self.pinch.write(e.EV_KEY, e.BTN_TOUCH, 1)
+        self.pinch.write(e.EV_KEY, e.BTN_TOOL_DOUBLETAP, 1)
+        self.pinch.syn()
+        self.pinching = True
+        self.pinch_base = 1.0
+
+    def pinch_update(self, scale):
+        half = self.half0 * scale / self.pinch_base
+        if not MIN_HALF < half < MAX_HALF:
+            # the fake fingers ran out of touchpad: lift them and put them back in
+            # the middle, so a long pinch keeps zooming instead of stalling
+            self.pinch_end()
+            self.pinch_begin()
+            self.pinch_base = scale
+            half = self.half0
+        self.fingers(half)
+        self.pinch.syn()
+
+    def pinch_end(self):
+        for slot in (0, 1):
+            self.pinch.write(e.EV_ABS, e.ABS_MT_SLOT, slot)
+            self.pinch.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
+        self.pinch.write(e.EV_KEY, e.BTN_TOUCH, 0)
+        self.pinch.write(e.EV_KEY, e.BTN_TOOL_DOUBLETAP, 0)
+        self.pinch.syn()
+        self.pinching = False
+
+    # protocol
+
+    def handle(self, line):
+        p = line.split()
+        if len(p) != 4 or p[0] not in ("k", "m", "b", "s", "g"):
+            return  # includes the "h" heartbeat: it only matters that it arrived
+        try:
+            self._dispatch(p)
+        except (ValueError, OSError) as err:
+            self.write_errors += 1
+            if self.write_errors <= 3:
+                say(f"bad or failed message {line!r}: {err}")
+
+    def _dispatch(self, p):
         tag = p[0]
-        if tag not in ("k", "m", "b", "s", "g"):
-            continue
         if tag == "k":
             t, c, v = int(p[1]), int(p[2]), int(p[3])
             if t != e.EV_SYN:
-                kbd_pending.append((t, c, v))
-                continue
-            pace(v)
-            for t, c, val in kbd_pending:
-                kbd.write(t, c, val)
-            kbd.syn()
-            kbd_pending.clear()
+                self.kbd_pending.append((t, c, v))
+                return
+            self.pace(v)
+            for t, c, val in self.kbd_pending:
+                self.kbd.write(t, c, val)
+                if t == e.EV_KEY and val in (0, 1):
+                    (self.keys_down.add if val else self.keys_down.discard)(c)
+            self.kbd.syn()
+            self.kbd_pending.clear()
 
         elif tag == "m":
-            pace(int(p[3]))
-            rem_x += float(p[1]) * SCALE
-            rem_y += float(p[2]) * SCALE
-            dx, dy = int(rem_x), int(rem_y)
-            rem_x -= dx
-            rem_y -= dy
+            self.pace(int(p[3]))
+            self.rem_x += float(p[1]) * self.scale
+            self.rem_y += float(p[2]) * self.scale
+            dx, dy = int(self.rem_x), int(self.rem_y)
+            self.rem_x -= dx
+            self.rem_y -= dy
             if dx or dy:
                 if dx:
-                    ptr.write(e.EV_REL, e.REL_X, dx)
+                    self.ptr.write(e.EV_REL, e.REL_X, dx)
                 if dy:
-                    ptr.write(e.EV_REL, e.REL_Y, dy)
-                ptr.syn()
+                    self.ptr.write(e.EV_REL, e.REL_Y, dy)
+                self.ptr.syn()
 
         elif tag == "b":
-            pace(int(p[3]))
-            ptr.write(e.EV_KEY, int(p[1]), int(p[2]))
-            ptr.syn()
+            self.pace(int(p[3]))
+            code, val = int(p[1]), int(p[2])
+            self.ptr.write(e.EV_KEY, code, val)
+            self.ptr.syn()
+            (self.buttons_down.add if val else self.buttons_down.discard)(code)
 
         elif tag == "s":
-            pace(int(p[3]))
+            self.pace(int(p[3]))
             # libinput: 15 units per wheel click (= 120 hi-res), positive is down
-            rem_v += -float(p[1]) * 8
-            rem_h += float(p[2]) * 8
-            hv, hh = int(rem_v), int(rem_h)
-            rem_v -= hv
-            rem_h -= hh
+            self.rem_v += -float(p[1]) * 8
+            self.rem_h += float(p[2]) * 8
+            hv, hh = int(self.rem_v), int(self.rem_h)
+            self.rem_v -= hv
+            self.rem_h -= hh
             if hv:
-                ptr.write(e.EV_REL, e.REL_WHEEL_HI_RES, hv)
-                acc_v += hv
-                if abs(acc_v) >= 120:
-                    ptr.write(e.EV_REL, e.REL_WHEEL, int(acc_v / 120))
-                    acc_v -= int(acc_v / 120) * 120
+                self.ptr.write(e.EV_REL, e.REL_WHEEL_HI_RES, hv)
+                self.acc_v += hv
+                if abs(self.acc_v) >= 120:
+                    self.ptr.write(e.EV_REL, e.REL_WHEEL, int(self.acc_v / 120))
+                    self.acc_v -= int(self.acc_v / 120) * 120
             if hh:
-                ptr.write(e.EV_REL, e.REL_HWHEEL_HI_RES, hh)
-                acc_h += hh
-                if abs(acc_h) >= 120:
-                    ptr.write(e.EV_REL, e.REL_HWHEEL, int(acc_h / 120))
-                    acc_h -= int(acc_h / 120) * 120
+                self.ptr.write(e.EV_REL, e.REL_HWHEEL_HI_RES, hh)
+                self.acc_h += hh
+                if abs(self.acc_h) >= 120:
+                    self.ptr.write(e.EV_REL, e.REL_HWHEEL, int(self.acc_h / 120))
+                    self.acc_h -= int(self.acc_h / 120) * 120
             if hv or hh:
-                ptr.syn()
+                self.ptr.syn()
 
         elif tag == "g":
-            pace(int(p[3]))
-            if p[1] == "b" and not pinching:
-                for slot, x in ((0, CX - HALF0), (1, CX + HALF0)):
-                    touch_id = (touch_id + 1) % 65536
-                    pinch.write(e.EV_ABS, e.ABS_MT_SLOT, slot)
-                    pinch.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, touch_id)
-                    pinch.write(e.EV_ABS, e.ABS_MT_POSITION_X, x)
-                    pinch.write(e.EV_ABS, e.ABS_MT_POSITION_Y, CY)
-                pinch.write(e.EV_ABS, e.ABS_X, CX - HALF0)
-                pinch.write(e.EV_ABS, e.ABS_Y, CY)
-                pinch.write(e.EV_KEY, e.BTN_TOUCH, 1)
-                pinch.write(e.EV_KEY, e.BTN_TOOL_DOUBLETAP, 1)
-                pinch.syn()
-                pinching = True
-            elif p[1] == "u" and pinching:
-                fingers(HALF0 * float(p[2]))
-                pinch.syn()
-            elif p[1] == "e" and pinching:
-                for slot in (0, 1):
-                    pinch.write(e.EV_ABS, e.ABS_MT_SLOT, slot)
-                    pinch.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
-                pinch.write(e.EV_KEY, e.BTN_TOUCH, 0)
-                pinch.write(e.EV_KEY, e.BTN_TOOL_DOUBLETAP, 0)
-                pinch.syn()
-                pinching = False
-    except (ValueError, OSError):
-        continue
+            self.pace(int(p[3]))
+            if p[1] == "b" and not self.pinching:
+                self.pinch_begin()
+            elif p[1] == "u" and self.pinching:
+                self.pinch_update(float(p[2]))
+            elif p[1] == "e" and self.pinching:
+                self.pinch_end()
+
+
+def serve(rp, fd, watchdog_s, dead_s):
+    """Feed lines from `fd` to the replayer until EOF or `dead_s` of silence.
+
+    The sender sends a heartbeat every second, so silence means the link is
+    dead, not that the user is idle."""
+    buf = b""
+    last = time.monotonic()
+    released = True  # nothing pressed yet
+    while True:
+        r, _, _ = select.select([fd], [], [], min(0.5, max(0.01, watchdog_s / 4)))
+        now = time.monotonic()
+        if r:
+            data = os.read(fd, 65536)
+            if not data:
+                break
+            last, released = now, False
+            buf += data
+            *lines, buf = buf.split(b"\n")
+            for raw in lines:
+                rp.handle(raw.decode(errors="replace"))
+            continue
+        idle = now - last
+        if idle >= watchdog_s and not released:
+            say(f"no data for {idle:.0f} s, releasing all keys and buttons")
+            rp.release_all()
+            released = True
+        if idle >= dead_s:
+            say(f"no data for {idle:.0f} s, assuming the sender is gone")
+            break
+    rp.release_all()
+
+
+def main():
+    cfg = load_config()
+    kbd, ptr, pinch = make_devices()
+    time.sleep(0.5)  # let the compositor pick up the new devices
+    print(f"READY {PROTO}", flush=True)
+    serve(Replayer(kbd, ptr, pinch, cfg), 0, cfg["watchdog_s"], cfg["dead_s"])
+
+
+if __name__ == "__main__":
+    main()
