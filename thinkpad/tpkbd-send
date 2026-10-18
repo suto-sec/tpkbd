@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 # tpkbd-send: forward the ThinkPad's keyboard, TrackPoint and touchpad to the PC.
-# Run as root. Hold both Ctrl keys and press Esc to stop (exit code 42).
+#
+# Keyboard mode: grabs everything at once. Hold both Ctrl keys and press Esc to
+# stop (exit code 42).
+#
+# Needs read/write access to /dev/input (root, or a user in the "input" group).
+# Settings live in /etc/tpkbd/tpkbd.conf, see thinkpad/tpkbd.conf.example.
+import argparse
+import configparser
 import os
 import pty
 import re
 import select
+import signal
+import socket
 import subprocess
 import sys
 import time
@@ -12,17 +21,22 @@ import time
 import evdev
 from evdev import ecodes as e
 
-SSH_CONFIG = "/etc/tpkbd/ssh_config"
-HOST = "tpkbd-pc"
-READY_TIMEOUT = 15
+PROTO = 2                       # must match tpkbd-recv
+CONF_PATH = "/etc/tpkbd/tpkbd.conf"
+EXIT_ESCAPE = 42
 
-KEYBOARD = ["AT Translated Set 2 keyboard", "ThinkPad Extra Buttons"]
-POINTING = ["TrackPoint", "Synaptics TM3276"]
-
-LIBINPUT_OPTS = ["--set-profile=adaptive", "--set-speed=0",
-                 "--enable-tap", "--disable-dwt"]
-
-ESCAPE = {e.KEY_LEFTCTRL, e.KEY_RIGHTCTRL, e.KEY_ESC}
+DEFAULTS = {
+    "ssh_config": "/etc/tpkbd/ssh_config",
+    "host": "tpkbd-pc",
+    "ready_timeout": "15",
+    "heartbeat_s": "1",
+    "keyboard": "AT Translated Set 2 keyboard, ThinkPad Extra Buttons",
+    "pointing": "TrackPoint, Synaptics TM3276",
+    "libinput_opts": "--set-profile=adaptive --set-speed=0 --enable-tap --disable-dwt",
+    # keys that are not forwarded (Fn+4 would suspend the PC)
+    "block_keys": "KEY_SLEEP KEY_SUSPEND KEY_WAKEUP KEY_POWER",
+    "escape_keys": "KEY_LEFTCTRL KEY_RIGHTCTRL KEY_ESC",
+}
 
 # libinput debug-events output. Repeated events get a counter column before
 # the timestamp, so that part is optional.
@@ -32,135 +46,432 @@ RE_BUTTON = re.compile(r"POINTER_BUTTON" + TS + r"\S+ \((\d+)\) (pressed|release
 RE_SCROLL = re.compile(r"POINTER_SCROLL_(?:FINGER|CONTINUOUS)" + TS +
                        r"vert (-?\d+\.\d+)/\S+ horiz (-?\d+\.\d+)/")
 RE_PINCH_UPDATE = re.compile(r"GESTURE_PINCH_UPDATE.*unaccelerated\)\s+(-?\d+\.\d+) @")
+# events we depend on: if one of these shows up but matches nothing above,
+# libinput's output format has probably changed
+RE_EXPECTED = re.compile(r"\b(?:POINTER_MOTION|POINTER_BUTTON|POINTER_SCROLL_FINGER|"
+                         r"POINTER_SCROLL_CONTINUOUS|GESTURE_PINCH_UPDATE)\s")
 
 
 def log(msg):
     print(f"tpkbd: {msg}", flush=True)
 
 
-def find(names):
-    found = []
-    for path in evdev.list_devices():
-        d = evdev.InputDevice(path)
-        if any(n in d.name for n in names):
-            found.append(d)
-        else:
-            d.close()
-    return found
-
-
 def now_us():
     return int(time.time() * 1_000_000)
 
 
-kbds = find(KEYBOARD)
-pointing = find(POINTING)
-if not kbds or not pointing:
-    sys.exit(f"missing devices: keyboard={[d.name for d in kbds]} "
-             f"pointing={[d.name for d in pointing]}")
-pointing_paths = [d.path for d in pointing]
-for d in pointing:
-    d.close()
-
-log("connecting to the PC...")
-t0 = time.monotonic()
-
-# -tt: with a pty, ssh sets TCP_NODELAY, otherwise small writes get delayed
-ssh = subprocess.Popen(
-    ["ssh", "-F", SSH_CONFIG, "-tt", "-e", "none",
-     "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-     "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-     HOST],
-    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+class LinkError(Exception):
+    pass
 
 
-def send(lines):
+# ---------------------------------------------------------------- config
+
+def split_names(text):
+    return [x.strip() for x in text.split(",") if x.strip()]
+
+
+def key_codes(text):
+    codes = set()
+    for name in text.replace(",", " ").split():
+        if name not in e.ecodes:
+            raise ValueError(f"unknown key name {name!r}")
+        codes.add(e.ecodes[name])
+    return frozenset(codes)
+
+
+def load_config(path=CONF_PATH):
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.read_dict({"sender": DEFAULTS})
+    cp.read(path)  # a missing file just means defaults
+    s = cp["sender"]
+    return {
+        "ssh_config": s["ssh_config"],
+        "host": s["host"],
+        "ready_timeout": float(s["ready_timeout"]),
+        "heartbeat_s": float(s["heartbeat_s"]),
+        "keyboard": split_names(s["keyboard"]),
+        "pointing": split_names(s["pointing"]),
+        "libinput_opts": s["libinput_opts"].split(),
+        "block_keys": key_codes(s["block_keys"]),
+        "escape_keys": key_codes(s["escape_keys"]),
+    }
+
+
+# ------------------------------------------------------- pure helpers
+
+def parse_libinput_line(line):
+    """Protocol payload (without timestamp) for one debug-events line, or None."""
+    if "GESTURE_PINCH_BEGIN" in line:
+        return "g b 1"
+    if m := RE_PINCH_UPDATE.search(line):
+        return f"g u {m[1]}"
+    if "GESTURE_PINCH_END" in line:
+        return "g e 1"
+    if m := RE_MOTION.search(line):
+        return f"m {m[1]} {m[2]}"
+    if m := RE_BUTTON.search(line):
+        return f"b {m[1]} {1 if m[2] == 'pressed' else 0}"
+    if m := RE_SCROLL.search(line):
+        return f"s {m[1]} {m[2]}"
+    return None
+
+
+def looks_parseable(line):
+    return bool(RE_EXPECTED.search(line))
+
+
+def chord_active(codes, held):
+    return bool(codes) and codes <= held
+
+
+def release_lines(keys, buttons, ts):
+    """Protocol lines that let go of everything still pressed on the PC."""
+    out = [f"k {e.EV_KEY} {code} 0" for code in sorted(keys)]
+    if keys:
+        out.append(f"k 0 0 {ts}")
+    out += [f"b {code} 0 {ts}" for code in sorted(buttons)]
+    return out
+
+
+class RateLimited:
+    """Lets the first few messages through, then one per `every` seconds."""
+
+    def __init__(self, first=3, every=60.0):
+        self.first, self.every = first, every
+        self.count, self.last = 0, 0.0
+
+    def ok(self, now=None):
+        now = time.monotonic() if now is None else now
+        self.count += 1
+        if self.count <= self.first or now - self.last >= self.every:
+            self.last = now
+            return True
+        return False
+
+
+def sd_notify(msg):
+    path = os.environ.get("NOTIFY_SOCKET")
+    if not path:
+        return
+    if path[0] == "@":
+        path = "\0" + path[1:]
     try:
-        ssh.stdin.write("\n".join(lines) + "\n")
-        ssh.stdin.flush()
-    except (BrokenPipeError, OSError):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(path)
+            s.sendall(msg.encode())
+    except OSError:
         pass
 
 
-# don't grab anything until the receiver has created its devices
-deadline = time.monotonic() + READY_TIMEOUT
-while True:
-    left = deadline - time.monotonic()
-    if left <= 0 or ssh.poll() is not None:
-        ssh.terminate()
-        sys.exit("tpkbd: PC not reachable or receiver not ready (will retry)")
-    r, _, _ = select.select([ssh.stdout], [], [], left)
-    if r and ssh.stdout.readline().strip() == "READY":
-        break
+# ------------------------------------------------------------ ssh link
 
-# libinput on a pty so its output isn't buffered
-master, slave = pty.openpty()
-dev_args = [arg for p in pointing_paths for arg in ("--device", p)]
-li = subprocess.Popen(["libinput", "debug-events", "--grab", *dev_args, *LIBINPUT_OPTS],
-                      stdin=subprocess.DEVNULL, stdout=slave, stderr=subprocess.DEVNULL)
-os.close(slave)
+class Link:
+    """The ssh connection to tpkbd-recv on the PC."""
 
-for d in kbds:
-    d.grab()
-kbd_fds = {d.fd: d for d in kbds}
-pending = []
-held = set()
-li_buf = b""
+    def __init__(self, cfg, argv=None):
+        self.cfg = cfg
+        # -tt: with a pty, ssh sets TCP_NODELAY, otherwise small writes get delayed
+        self.argv = argv or [
+            "ssh", "-F", cfg["ssh_config"], "-tt", "-e", "none",
+            "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+            "-o", "UpdateHostKeys=no",
+            cfg["host"]]
+        self.proc = None
+        self.fd = None
+        self.eof = False
+        self._buf = b""
 
-log(f"CONNECTED after {time.monotonic() - t0:.1f} s (hold both Ctrl + Esc to stop)")
+    def start(self):
+        self.proc = subprocess.Popen(self.argv, stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, bufsize=0)
+        self.fd = self.proc.stdout.fileno()
 
-try:
-    while True:
-        ready, _, _ = select.select([*kbd_fds, master], [], [], 1.0)
-        for fd in ready:
-            if fd == master:
-                try:
-                    li_buf += os.read(master, 4096)
-                except OSError:
-                    log("libinput stopped")
-                    sys.exit(1)
-                *lines, li_buf = li_buf.split(b"\n")
-                out = []
-                for raw in lines:
-                    line = raw.decode(errors="replace")
-                    if "GESTURE_PINCH_BEGIN" in line:
-                        out.append(f"g b 1 {now_us()}")
-                    elif m := RE_PINCH_UPDATE.search(line):
-                        out.append(f"g u {m[1]} {now_us()}")
-                    elif "GESTURE_PINCH_END" in line:
-                        out.append(f"g e 1 {now_us()}")
-                    elif m := RE_MOTION.search(line):
-                        out.append(f"m {m[1]} {m[2]} {now_us()}")
-                    elif m := RE_BUTTON.search(line):
-                        out.append(f"b {m[1]} {1 if m[2] == 'pressed' else 0} {now_us()}")
-                    elif m := RE_SCROLL.search(line):
-                        out.append(f"s {m[1]} {m[2]} {now_us()}")
-                if out:
-                    send(out)
+    def poll(self):
+        return self.proc.poll()
+
+    def send(self, lines):
+        if not lines:
+            return
+        try:
+            self.proc.stdin.write(("\n".join(lines) + "\n").encode())
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    def read_lines(self):
+        """Read what the PC printed. Never blocks if select() said it's readable."""
+        chunk = os.read(self.fd, 4096)
+        if not chunk:
+            self.eof = True
+            rest, self._buf = self._buf, b""
+            return [rest.decode(errors="replace").strip()] if rest.strip() else []
+        self._buf += chunk
+        *lines, self._buf = self._buf.split(b"\n")
+        return [x.decode(errors="replace").strip() for x in lines if x.strip()]
+
+    def wait_ready(self, timeout, log=log):
+        """Wait for the receiver's `READY <proto>`. Anything else it prints is logged."""
+        deadline = time.monotonic() + timeout
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise LinkError("PC not reachable or receiver not ready (will retry)")
+            r, _, _ = select.select([self.fd], [], [], left)
+            if not r:
                 continue
-            for ev in kbd_fds[fd].read():
-                if ev.type == e.EV_SYN:
-                    if ev.code == e.SYN_REPORT and pending:
-                        pending.append(f"k 0 0 {ev.sec * 1_000_000 + ev.usec}")
-                        send(pending)
-                        pending.clear()
-                elif ev.type == e.EV_KEY and ev.value != 2:  # the PC does its own key repeat
-                    (held.add if ev.value else held.discard)(ev.code)
-                    if ESCAPE <= held:
-                        log("stopped (Ctrl+Ctrl+Esc)")
-                        sys.exit(42)
-                    pending.append(f"k {ev.type} {ev.code} {ev.value}")
-        if ssh.poll() is not None:
-            log("connection lost")
-            sys.exit(1)
-        if li.poll() is not None:
+            for line in self.read_lines():
+                m = re.fullmatch(r"READY(?: (\d+))?", line)
+                if not m:
+                    log(f"pc: {line}")
+                elif m[1] is None:
+                    raise LinkError("receiver speaks protocol 1, this sender speaks "
+                                    f"{PROTO}: re-run pc/install.sh on the PC")
+                elif int(m[1]) != PROTO:
+                    raise LinkError(f"receiver speaks protocol {m[1]}, this sender "
+                                    f"speaks {PROTO}: update the older side")
+                else:
+                    return
+            if self.eof:
+                raise LinkError("PC not reachable or receiver not ready (will retry)")
+
+    def close(self):
+        if self.proc is None:
+            return
+        try:
+            self.proc.stdin.close()  # EOF: the receiver exits and drops its devices
+        except (OSError, ValueError):
+            pass
+        try:
+            self.proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc.stdout.close()
+
+
+# -------------------------------------------------------------- sender
+
+class Sender:
+    def __init__(self, cfg, link=None):
+        self.cfg = cfg
+        self.link = link
+        self.kbds = []
+        self.pointing_paths = []
+        self.li = None
+        self.master = None
+        self.li_buf = b""
+        self.state = "local"
+        self.held = set()           # physical keys currently down
+        self.forwarded = set()      # keys the PC currently sees as down
+        self.buttons = set()        # pointer buttons the PC sees as down
+        self.batch = []
+        self.next_hb = 0.0
+        self.warn = RateLimited()
+
+    # devices
+
+    def open_devices(self):
+        def find(names):
+            found = []
+            for path in evdev.list_devices():
+                try:
+                    d = evdev.InputDevice(path)
+                except PermissionError:
+                    sys.exit(f"tpkbd: no permission on {path}: run as root or "
+                             "as a user in the input group")
+                if any(n in d.name for n in names):
+                    found.append(d)
+                else:
+                    d.close()
+            return found
+
+        self.kbds = find(self.cfg["keyboard"])
+        pointing = find(self.cfg["pointing"])
+        if not self.kbds or not pointing:
+            sys.exit(f"missing devices: keyboard={[d.name for d in self.kbds]} "
+                     f"pointing={[d.name for d in pointing]}")
+        self.pointing_paths = [d.path for d in pointing]
+        for d in pointing:
+            d.close()
+        for d in self.kbds:
+            self.held.update(d.active_keys())
+
+    def _grab_all(self):
+        grabbed = []
+        try:
+            for d in self.kbds:
+                d.grab()
+                grabbed.append(d)
+        except OSError:
+            for d in grabbed:
+                d.ungrab()
+            raise
+
+    def _ungrab_all(self):
+        for d in self.kbds:
+            try:
+                d.ungrab()
+            except OSError:
+                pass
+
+    def start_libinput(self):
+        # libinput on a pty so its output isn't buffered; LC_ALL=C pins the number format
+        master, slave = pty.openpty()
+        dev_args = [a for p in self.pointing_paths for a in ("--device", p)]
+        self.li = subprocess.Popen(
+            ["libinput", "debug-events", "--grab", *dev_args, *self.cfg["libinput_opts"]],
+            stdin=subprocess.DEVNULL, stdout=slave, stderr=subprocess.DEVNULL,
+            env={**os.environ, "LC_ALL": "C"})
+        os.close(slave)
+        self.master = master
+        self.li_buf = b""
+
+    def stop_libinput(self):
+        if self.li is not None:
+            self.li.terminate()  # exiting drops its grab on the pointing devices
+            try:
+                self.li.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.li.kill()
+                self.li.wait()
+            self.li = None
+        if self.master is not None:
+            os.close(self.master)
+            self.master = None
+        self.li_buf = b""
+
+    # state
+
+    def enter_remote(self):
+        self._grab_all()
+        try:
+            self.start_libinput()
+        except OSError:
+            self._ungrab_all()
+            raise
+        self.forwarded.clear()
+        self.buttons.clear()
+        self.batch.clear()
+        self.state = "remote"
+
+    # events
+
+    def handle_key(self, ev):
+        if ev.type == e.EV_SYN:
+            if ev.code == e.SYN_REPORT and self.batch:
+                self.batch.append(f"k 0 0 {ev.sec * 1_000_000 + ev.usec}")
+                self.link.send(self.batch)
+                self.batch = []
+            return
+        if ev.type != e.EV_KEY or ev.value == 2:  # the PC does its own key repeat
+            return
+        pressed = ev.value != 0
+        (self.held.add if pressed else self.held.discard)(ev.code)
+        if pressed:
+            if chord_active(self.cfg["escape_keys"], self.held):
+                log("stopped (escape hotkey)")
+                sys.exit(EXIT_ESCAPE)
+        if self.state != "remote" or ev.code in self.cfg["block_keys"]:
+            return
+        (self.forwarded.add if pressed else self.forwarded.discard)(ev.code)
+        self.batch.append(f"k {ev.type} {ev.code} {ev.value}")
+
+    def handle_libinput(self):
+        try:
+            self.li_buf += os.read(self.master, 4096)
+        except OSError:
             log("libinput stopped")
             sys.exit(1)
-finally:
-    for d in kbds:
-        try:
-            d.ungrab()
-        except OSError:
-            pass
-    li.terminate()
-    ssh.terminate()
+        *lines, self.li_buf = self.li_buf.split(b"\n")
+        out = []
+        for raw in lines:
+            line = raw.decode(errors="replace")
+            payload = parse_libinput_line(line)
+            if payload is None:
+                if looks_parseable(line) and self.warn.ok():
+                    log(f"unparsed libinput line (did its format change?): {line.strip()!r}")
+                continue
+            if payload.startswith("b "):
+                _, code, down = payload.split()
+                (self.buttons.add if down == "1" else self.buttons.discard)(int(code))
+            out.append(f"{payload} {now_us()}")
+        self.link.send(out)
+
+    def heartbeat(self, now):
+        if now >= self.next_hb:
+            self.link.send([f"h {now_us()}"])
+            self.next_hb = now + self.cfg["heartbeat_s"]
+
+    # main loop
+
+    def run(self):
+        self.open_devices()
+        log("connecting to the PC...")
+        t0 = time.monotonic()
+        self.link = Link(self.cfg)
+        self.link.start()
+        self.link.wait_ready(self.cfg["ready_timeout"])  # nothing is grabbed before this
+        self.enter_remote()
+        log(f"CONNECTED after {time.monotonic() - t0:.1f} s (hold both Ctrl + Esc to stop)")
+        sd_notify("READY=1\nSTATUS=" + self.state)
+        kbd_fds = {d.fd: d for d in self.kbds}
+        while True:
+            fds = list(kbd_fds)
+            if self.master is not None:
+                fds.append(self.master)
+            if not self.link.eof:
+                fds.append(self.link.fd)
+            timeout = max(0.0, min(1.0, self.next_hb - time.monotonic()))
+            ready, _, _ = select.select(fds, [], [], timeout)
+            for fd in ready:
+                if fd == self.master:
+                    self.handle_libinput()
+                elif fd == self.link.fd:
+                    for line in self.link.read_lines():
+                        log(f"pc: {line}")
+                else:
+                    for ev in kbd_fds[fd].read():
+                        self.handle_key(ev)
+            self.heartbeat(time.monotonic())
+            if self.link.poll() is not None:
+                log("connection lost")
+                sys.exit(1)
+            if self.li is not None and self.li.poll() is not None:
+                log("libinput stopped")
+                sys.exit(1)
+
+    def shutdown(self):
+        if self.link is not None and self.link.proc is not None:
+            # the PC would otherwise keep anything still pressed
+            self.link.send(release_lines(self.forwarded, self.buttons, now_us()))
+        self.stop_libinput()
+        self._ungrab_all()
+        if self.link is not None:
+            self.link.close()
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Forward this laptop's input to a PC.")
+    ap.add_argument("--config", default=CONF_PATH)
+    args = ap.parse_args(argv)
+    try:
+        cfg = load_config(args.config)
+    except (ValueError, KeyError) as err:
+        sys.exit(f"tpkbd: bad config {args.config}: {err}")
+    # exit through `finally` on systemctl stop; 0 tells tpkbd-screen to restore the panel
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    sender = Sender(cfg)
+    try:
+        sender.run()
+    except LinkError as err:
+        sys.exit(f"tpkbd: {err}")
+    finally:
+        sender.shutdown()
+
+
+if __name__ == "__main__":
+    main()

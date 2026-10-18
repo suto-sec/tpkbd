@@ -1,0 +1,22 @@
+# copy to /etc/tpkbd/tpkbd.conf; every line is optional, these are the defaults
+[sender]
+# ssh_config = /etc/tpkbd/ssh_config
+# host = tpkbd-pc
+
+# seconds to wait for the receiver before giving up (systemd retries)
+# ready_timeout = 15
+# heartbeat the receiver uses to notice a dead link
+# heartbeat_s = 1
+
+# comma-separated device name substrings, see: grep Name= /proc/bus/input/devices
+# keyboard = AT Translated Set 2 keyboard, ThinkPad Extra Buttons
+# pointing = TrackPoint, Synaptics TM3276
+
+# how libinput processes the pointer input (libinput debug-events --help)
+# libinput_opts = --set-profile=adaptive --set-speed=0 --enable-tap --disable-dwt
+
+# keys that are never forwarded (Fn+4 would otherwise suspend the PC)
+# block_keys = KEY_SLEEP KEY_SUSPEND KEY_WAKEUP KEY_POWER
+
+# this chord stops keyboard mode
+# escape_keys = KEY_LEFTCTRL KEY_RIGHTCTRL KEY_ESC
