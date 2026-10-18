@@ -19,6 +19,7 @@ fi
 
 getent group tpkbd >/dev/null || groupadd --system tpkbd
 install -m 755 "$here/tpkbd-hid" /usr/local/bin/tpkbd-hid
+install -m 755 "$here/tpkbd-recv" /usr/local/bin/tpkbd-recv
 install -m 644 "$here/tpkbd-gadget.service" /etc/systemd/system/tpkbd-gadget.service
 install -m 644 "$here/60-tpkbd-hid.rules" /etc/udev/rules.d/60-tpkbd-hid.rules
 install -m 644 "$here/tpkbd-modules.conf" /etc/modules-load.d/tpkbd.conf
@@ -27,6 +28,14 @@ user=${SUDO_USER:-}
 if [ -n "$user" ] && [ "$user" != root ]; then
     usermod -aG tpkbd "$user"
     echo "added $user to the tpkbd group (log out and in again for it to apply)"
+fi
+
+if [ -n "$user" ] && [ "$user" != root ]; then
+    home=$(getent passwd "$user" | cut -d: -f6)
+    if [ ! -f "$home/.config/tpkbd/recv.conf" ]; then
+        install -d -o "$user" -m 755 "$home/.config/tpkbd"
+        install -o "$user" -m 644 "$here/recv.conf.example" "$home/.config/tpkbd/recv.conf"
+    fi
 fi
 
 udevadm control --reload
@@ -39,3 +48,4 @@ else
     exit 1
 fi
 echo "Next: plug the Pi's USB port into a computer and run: tpkbd-hid test (see docs/gadget.md)"
+echo "Then, to type from the ThinkPad: docs/gadget.md section 6"
