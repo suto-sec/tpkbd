@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+# tpkbd-pair: pin the PC's SSH host key and print the line to authorize on the PC.
+# Run with sudo after thinkpad/install.sh, with the PC powered on:
+#
+#   sudo tpkbd-pair
+#
+# It never trusts the network on its own: it shows the host key fingerprint and
+# waits for you to compare it with the one printed on the PC
+# (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub).
+import argparse
+import ipaddress
+import os
+import pwd
+import re
+import subprocess
+import sys
+
+CONF_DIR = "/etc/tpkbd"
+SSH_CONFIG = f"{CONF_DIR}/ssh_config"
+HOST = "tpkbd-pc"
+SERVICE_USER = "tpkbd"
+
+
+def run(argv, **kw):
+    return subprocess.run(argv, capture_output=True, text=True, **kw)
+
+
+def parse_ssh_g(text):
+    """`ssh -G` output as a dict of its first value per key."""
+    out = {}
+    for line in text.splitlines():
+        key, _, value = line.partition(" ")
+        out.setdefault(key, value.strip())
+    return out
+
+
+def parse_keyscan(text):
+    """First `host keytype key` line of ssh-keyscan output -> (keytype, key), or None."""
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and not line.startswith("#"):
+            return parts[1], parts[2]
+    return None
+
+
+def route_source(text):
+    """Source address from `ip -4 route get` output, or None."""
+    m = re.search(r"\bsrc (\d+\.\d+\.\d+\.\d+)", text)
+    return m[1] if m else None
+
+
+def network_of(addr_text, src):
+    """The network (as ip_network) holding `src`, from `ip -4 -o addr show` output."""
+    for m in re.finditer(r"inet (\d+\.\d+\.\d+\.\d+/\d+)", addr_text):
+        iface = ipaddress.ip_interface(m[1])
+        if str(iface.ip) == src:
+            return iface.network
+    return None
+
+
+def authorized_line(network, pubkey):
+    return (f'from="{network}",restrict,pty,'
+            f'command="stty -echo; exec /usr/local/bin/tpkbd-recv" {pubkey.strip()}')
+
+
+def write_known_hosts(path, alias, keytype, key):
+    run(["ssh-keygen", "-R", alias, "-f", path])  # drop an older entry, if any
+    with open(path, "a") as f:
+        f.write(f"{alias} {keytype} {key}\n")
+    os.chmod(path, 0o644)
+    try:
+        pw = pwd.getpwnam(SERVICE_USER)
+        os.chown(path, pw.pw_uid, pw.pw_gid)
+    except KeyError:
+        pass
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Pin the PC's SSH host key and print the line to authorize on the PC.")
+    ap.add_argument("--yes", action="store_true",
+                    help="don't ask: trust the key the PC presents right now")
+    args = ap.parse_args()
+    if os.geteuid() != 0:
+        sys.exit(f"run as root: sudo {sys.argv[0]}")
+    if not os.path.exists(SSH_CONFIG):
+        sys.exit(f"{SSH_CONFIG} not found: run thinkpad/install.sh first")
+
+    cfg = parse_ssh_g(run(["ssh", "-F", SSH_CONFIG, "-G", HOST]).stdout)
+    host, port = cfg.get("hostname"), cfg.get("port", "22")
+    known_hosts = cfg.get("userknownhostsfile", f"{CONF_DIR}/known_hosts").split()[0]
+    alias = cfg.get("hostkeyalias", HOST)
+    print(f"asking {host}:{port} for its host key...")
+
+    scan = run(["ssh-keyscan", "-t", "ed25519", "-p", port, "-T", "5", host])
+    found = parse_keyscan(scan.stdout)
+    if not found:
+        sys.exit(f"no ed25519 host key from {host}: is the PC on and sshd running?\n"
+                 f"{scan.stderr.strip()}")
+    keytype, key = found
+    fp = run(["ssh-keygen", "-lf", "-"], input=f"{host} {keytype} {key}\n").stdout.strip()
+    print(f"\nthe PC presents:  {fp}")
+    print("on the PC, run:   ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub")
+    if not args.yes and input("\ndo the fingerprints match? [y/N] ").strip().lower() != "y":
+        sys.exit("aborted, nothing was written")
+    write_known_hosts(known_hosts, alias, keytype, key)
+    print(f"pinned in {known_hosts}")
+
+    pub = f"{CONF_DIR}/id_ed25519.pub"
+    with open(pub) as f:
+        pubkey = f.read()
+    src = route_source(run(["ip", "-4", "route", "get", host]).stdout)
+    network = network_of(run(["ip", "-4", "-o", "addr", "show"]).stdout, src) if src else None
+    if network is None:
+        print("\ncould not work out this laptop's network: edit from= by hand")
+        network = "192.168.1.0/24"
+    print("\nappend this line to ~/.ssh/authorized_keys on the PC (>>, not >):\n")
+    print("# tpkbd")
+    print(authorized_line(network, pubkey))
+    print("\nthen try: sudo tpkbd-send")
+
+
+if __name__ == "__main__":
+    main()
