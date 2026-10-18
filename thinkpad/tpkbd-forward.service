@@ -2,15 +2,39 @@
 Description=tpkbd: forward ThinkPad keyboard, TrackPoint and touchpad to the PC
 Wants=network-online.target
 After=network-online.target display-manager.service getty@tty1.service
+Conflicts=tpkbd-soft.service
 StartLimitIntervalSec=0
 
 [Service]
-ExecStartPre=/usr/local/bin/tpkbd-screen off
+# tpkbd-send reports READY=1 once the PC answered; only then the panel goes off.
+# The "+" lines run as root without the sandbox below (they write to /sys).
+Type=notify
+User=tpkbd
+SupplementaryGroups=input
+ExecStartPre=+/usr/local/bin/tpkbd-screen pre
 ExecStart=/usr/local/bin/tpkbd-send
-ExecStopPost=/usr/local/bin/tpkbd-screen post
+ExecStartPost=+/usr/local/bin/tpkbd-screen off
+ExecStopPost=+/usr/local/bin/tpkbd-screen post
 Restart=always
 RestartSec=3
+# on stop only tpkbd-send gets SIGTERM, so it can release everything over ssh
+KillMode=mixed
 RestartPreventExitStatus=42
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+UMask=0077
 
 [Install]
 WantedBy=tpkbd-mode.target
