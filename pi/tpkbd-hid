@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""tpkbd-hid: turn the Pi into a USB keyboard and mouse, and test it.
+
+  tpkbd-hid gadget up|down|status    create / remove / inspect the USB gadget (root)
+  tpkbd-hid test                     type a few letters and wiggle the pointer on
+                                     whatever computer the Pi is plugged into
+
+The gadget has two separate HID functions (keyboard -> /dev/hidg0, mouse ->
+/dev/hidg1) without report IDs, in the standard boot-protocol layouts, so BIOS
+and bootloaders accept them. Standard library only.
+"""
+import argparse
+import errno
+import os
+import select
+import shutil
+import struct
+import sys
+import time
+
+# USB HID descriptors
+
+# Boot keyboard (USB HID spec, appendix B.1): modifiers, reserved, 6 key slots, LEDs out.
+KBD_DESC = bytes([
+    0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7,
+    0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01,
+    0x75, 0x08, 0x81, 0x01, 0x95, 0x05, 0x75, 0x01, 0x05, 0x08, 0x19, 0x01,
+    0x29, 0x05, 0x91, 0x02, 0x95, 0x01, 0x75, 0x03, 0x91, 0x01, 0x95, 0x06,
+    0x75, 0x08, 0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65,
+    0x81, 0x00, 0xC0,
+])
+KBD_REPORT_LEN = 8
+
+# Boot mouse (3 buttons, X, Y) plus a wheel byte. A boot-protocol host reads the first three bytes.
+MOUSE_DESC = bytes([
+    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, 0x05, 0x09,
+    0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01,
+    0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x03, 0x05, 0x01, 0x09, 0x30,
+    0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03,
+    0x81, 0x06, 0xC0, 0xC0,
+])
+MOUSE_REPORT_LEN = 4
+
+# Linux evdev key codes (input-event-codes.h) -> HID keyboard usages (usage page 0x07)
+
+# modifier keys are bits of report byte 0 instead of key slots
+MODIFIER_BITS = {
+    29: 0x01,   # KEY_LEFTCTRL
+    42: 0x02,   # KEY_LEFTSHIFT
+    56: 0x04,   # KEY_LEFTALT
+    125: 0x08,  # KEY_LEFTMETA
+    97: 0x10,   # KEY_RIGHTCTRL
+    54: 0x20,   # KEY_RIGHTSHIFT
+    100: 0x40,  # KEY_RIGHTALT
+    126: 0x80,  # KEY_RIGHTMETA
+}
+KEY_LEFTSHIFT = 42
+KEY_SPACE = 57
+
+KEY_USAGE = {
+    1: 0x29,    # ESC
+    12: 0x2D, 13: 0x2E, 14: 0x2A, 15: 0x2B,        # - = backspace tab
+    26: 0x2F, 27: 0x30, 28: 0x28,                  # [ ] enter
+    39: 0x33, 40: 0x34, 41: 0x35, 43: 0x31,        # ; ' ` backslash
+    51: 0x36, 52: 0x37, 53: 0x38,                  # , . /
+    55: 0x55,   # KPASTERISK
+    57: 0x2C,   # SPACE
+    58: 0x39,   # CAPSLOCK
+    69: 0x53, 70: 0x47,                            # NUMLOCK SCROLLLOCK
+    74: 0x56, 78: 0x57,                            # KPMINUS KPPLUS
+    83: 0x63, 86: 0x64,                            # KPDOT 102ND
+    96: 0x58, 98: 0x54, 99: 0x46,                  # KPENTER KPSLASH SYSRQ (PrtSc)
+    102: 0x4A, 103: 0x52, 104: 0x4B, 105: 0x50, 106: 0x4F,   # home up pgup left right
+    107: 0x4D, 108: 0x51, 109: 0x4E, 110: 0x49, 111: 0x4C,   # end down pgdn ins del
+    119: 0x48,  # PAUSE
+    127: 0x65,  # COMPOSE (menu)
+}
+# 1..9 0 -> usages 0x1E..0x27, F1..F10 and F11, F12 -> 0x3A..0x45
+KEY_USAGE.update({2 + i: 0x1E + i for i in range(10)})
+KEY_USAGE.update({59 + i: 0x3A + i for i in range(10)})
+KEY_USAGE.update({87: 0x44, 88: 0x45})
+# keypad 7 8 9 / 4 5 6 / 1 2 3 / 0
+KEY_USAGE.update({71: 0x5F, 72: 0x60, 73: 0x61, 75: 0x5C, 76: 0x5D, 77: 0x5E,
+                  79: 0x59, 80: 0x5A, 81: 0x5B, 82: 0x62})
+# letters, in the order of the three keyboard rows
+for _row, _first in (("qwertyuiop", 16), ("asdfghjkl", 30), ("zxcvbnm", 44)):
+    for _i, _ch in enumerate(_row):
+        KEY_USAGE[_first + _i] = 0x04 + ord(_ch) - ord("a")
+
+CHAR_KEY = {chr(ord("a") + (u - 0x04)): code for code, u in KEY_USAGE.items() if 0x04 <= u <= 0x1D}
+CHAR_KEY[" "] = KEY_SPACE
+
+BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 272, 273, 274
+BUTTON_BITS = {BTN_LEFT: 0x01, BTN_RIGHT: 0x02, BTN_MIDDLE: 0x04}
+
+ROLLOVER = 0x01     # "too many keys" in every slot, as real keyboards report it
+
+
+class HidError(Exception):
+    pass
+
+
+class GadgetError(Exception):
+    pass
+
+
+# report builders
+
+class Keyboard:
+    """Held keys -> 8-byte boot keyboard reports."""
+
+    def __init__(self):
+        self.mods = 0
+        self.keys = []      # HID usages in press order
+
+    def event(self, code, value):
+        """Apply an evdev key event; True if the report changed."""
+        if value == 2:
+            return False    # the host repeats keys itself
+        if code in MODIFIER_BITS:
+            before = self.mods
+            self.mods = (self.mods | MODIFIER_BITS[code]) if value else (self.mods & ~MODIFIER_BITS[code])
+            return self.mods != before
+        usage = KEY_USAGE.get(code)
+        if usage is None:
+            return False
+        if value and usage not in self.keys:
+            self.keys.append(usage)
+            return True
+        if not value and usage in self.keys:
+            self.keys.remove(usage)
+            return True
+        return False
+
+    def report(self):
+        if len(self.keys) > 6:
+            slots = [ROLLOVER] * 6
+        else:
+            slots = self.keys + [0] * (6 - len(self.keys))
+        return bytes([self.mods, 0] + slots)
+
+    def release_all(self):
+        self.mods = 0
+        self.keys.clear()
+        return self.report()
+
+
+class Mouse:
+    """Relative motion, buttons and wheel -> 4-byte reports."""
+
+    def __init__(self):
+        self.buttons = 0
+
+    def _pack(self, dx=0, dy=0, wheel=0):
+        return struct.pack("Bbbb", self.buttons, dx, dy, wheel)
+
+    def button(self, code, value):
+        """Report for a button event, or None if `code` isn't a mouse button."""
+        bit = BUTTON_BITS.get(code)
+        if bit is None:
+            return None
+        self.buttons = (self.buttons | bit) if value else (self.buttons & ~bit)
+        return self._pack()
+
+    def moves(self, dx, dy, wheel=0):
+        """Reports for a motion; large deltas are split into several reports."""
+        out = []
+        while dx or dy or wheel:
+            sx, sy, sw = (max(-127, min(127, v)) for v in (dx, dy, wheel))
+            out.append(self._pack(sx, sy, sw))
+            dx, dy, wheel = dx - sx, dy - sy, wheel - sw
+        return out
+
+    def release_all(self):
+        self.buttons = 0
+        return self._pack()
+
+
+class HidOut:
+    """A /dev/hidgN device. Writes never block for long: the host may be off or asleep."""
+
+    def __init__(self, fd):
+        self.fd = fd
+
+    @classmethod
+    def open(cls, path):
+        try:
+            return cls(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError as err:
+            raise HidError(f"cannot open {path}: {err.strerror} "
+                           "(is the gadget up? try: tpkbd-hid gadget status)") from err
+
+    def send(self, report, timeout=0.5):
+        """Write one report. False if the host didn't take it within `timeout` seconds."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                return os.write(self.fd, report) == len(report)
+            except BlockingIOError:
+                pass
+            except OSError as err:
+                if err.errno in (errno.ESHUTDOWN, errno.ENODEV, errno.EPIPE):
+                    return False    # not connected to a host (yet)
+                raise
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            select.select([], [self.fd], [], left)
+
+    def close(self):
+        os.close(self.fd)
+
+
+# the USB gadget (configfs)
+
+GADGET = "tpkbd"
+LANG = "0x409"
+
+
+class Gadget:
+    def __init__(self, configfs="/sys/kernel/config", udc_dir="/sys/class/udc", rmtree=False):
+        self.base = os.path.join(configfs, "usb_gadget")
+        self.root = os.path.join(self.base, GADGET)
+        self.udc_dir = udc_dir
+        self.rmtree = rmtree    # for tests on a plain directory; real configfs needs rmdir
+
+    def _put(self, rel, value):
+        data = value if isinstance(value, bytes) else str(value).encode()
+        with open(os.path.join(self.root, rel), "wb") as f:
+            f.write(data)
+
+    def _mkdir(self, rel):
+        os.makedirs(os.path.join(self.root, rel), exist_ok=True)
+
+    def _rmdir(self, rel):
+        path = os.path.join(self.root, rel)
+        if not os.path.isdir(path):
+            return
+        if self.rmtree:
+            shutil.rmtree(path)
+        else:
+            os.rmdir(path)
+
+    def pick_udc(self):
+        try:
+            names = sorted(os.listdir(self.udc_dir))
+        except OSError:
+            names = []
+        if not names:
+            raise GadgetError(f"no USB device controller in {self.udc_dir}: "
+                              "is dtoverlay=dwc2 set in config.txt, and did the Pi reboot?")
+        return names[0]
+
+    def up(self):
+        if not os.path.isdir(self.base):
+            raise GadgetError(f"{self.base} missing: load libcomposite "
+                              "(sudo modprobe libcomposite) and mount configfs")
+        udc = self.pick_udc()
+        if os.path.exists(self.root):
+            self.down()     # start from scratch, so running `up` twice is safe
+        self._mkdir("")
+        self._put("idVendor", "0x1d6b")     # Linux Foundation
+        self._put("idProduct", "0x0104")    # multifunction composite gadget
+        self._put("bcdUSB", "0x0200")
+        self._put("bcdDevice", "0x0100")
+        self._mkdir(f"strings/{LANG}")
+        self._put(f"strings/{LANG}/manufacturer", "tpkbd")
+        self._put(f"strings/{LANG}/product", "tpkbd keyboard and mouse")
+        self._put(f"strings/{LANG}/serialnumber", "0001")
+        self._mkdir(f"configs/c.1/strings/{LANG}")
+        self._put(f"configs/c.1/strings/{LANG}/configuration", "HID")
+        self._put("configs/c.1/MaxPower", 100)
+        self._put("configs/c.1/bmAttributes", "0xA0")   # bus powered, remote wakeup
+        for name, protocol, length, desc in (("hid.usb0", 1, KBD_REPORT_LEN, KBD_DESC),
+                                             ("hid.usb1", 2, MOUSE_REPORT_LEN, MOUSE_DESC)):
+            self._mkdir(f"functions/{name}")
+            self._put(f"functions/{name}/protocol", protocol)
+            self._put(f"functions/{name}/subclass", 1)      # boot interface
+            self._put(f"functions/{name}/report_length", length)
+            self._put(f"functions/{name}/report_desc", desc)
+            os.symlink(os.path.join(self.root, "functions", name),
+                       os.path.join(self.root, "configs", "c.1", name))
+        self._put("UDC", udc)
+
+    def down(self):
+        if not os.path.exists(self.root):
+            return
+        try:
+            self._put("UDC", "\n")      # unbind
+        except OSError:
+            pass
+        cfg = os.path.join(self.root, "configs", "c.1")
+        if os.path.isdir(cfg):
+            for name in os.listdir(cfg):
+                if os.path.islink(os.path.join(cfg, name)):
+                    os.unlink(os.path.join(cfg, name))
+        for rel in (f"configs/c.1/strings/{LANG}", "configs/c.1", "functions/hid.usb0",
+                    "functions/hid.usb1", f"strings/{LANG}", ""):
+            self._rmdir(rel)
+
+    def status(self):
+        """One line: 'down', 'idle' (not bound), or the bound controller's state."""
+        if not os.path.exists(self.root):
+            return "down"
+        try:
+            with open(os.path.join(self.root, "UDC")) as f:
+                udc = f.read().strip()
+        except OSError:
+            udc = ""
+        if not udc:
+            return "idle (gadget exists, not bound to a controller)"
+        try:
+            with open(os.path.join(self.udc_dir, udc, "state")) as f:
+                state = f.read().strip()
+        except OSError:
+            state = "unknown"
+        return f"{udc}: {state}"
+
+
+# self-test
+
+def key_tap(kb, out, code, sleep):
+    for value in (1, 0):
+        if kb.event(code, value) and not out.send(kb.report()):
+            raise HidError("the computer isn't reading the keyboard "
+                           "(unplugged, asleep, or not enumerated: tpkbd-hid gadget status)")
+        sleep(0.03)
+
+
+def type_text(kb, out, text, sleep=time.sleep):
+    """Type lowercase letters and spaces; a capital letter is typed with Shift."""
+    for ch in text:
+        code = CHAR_KEY.get(ch.lower())
+        if code is None:
+            raise HidError(f"can't type {ch!r}: the self-test knows letters and spaces")
+        if ch.isupper():
+            kb.event(KEY_LEFTSHIFT, 1)
+            out.send(kb.report())
+        key_tap(kb, out, code, sleep)
+        if ch.isupper():
+            kb.event(KEY_LEFTSHIFT, 0)
+            out.send(kb.report())
+
+
+def wiggle(mouse, out, sleep=time.sleep):
+    """A small square, then one wheel click down and up."""
+    for dx, dy in ((4, 0), (0, 4), (-4, 0), (0, -4)):
+        for _ in range(15):
+            for report in mouse.moves(dx, dy):
+                out.send(report)
+            sleep(0.01)
+    for wheel in (-1, 1):
+        for report in mouse.moves(0, 0, wheel):
+            out.send(report)
+        sleep(0.2)
+
+
+def run_test(kbd_out, mouse_out, text="Tpkbd test", countdown=3, sleep=time.sleep, log=print):
+    kb, mouse = Keyboard(), Mouse()
+    try:
+        for n in range(countdown, 0, -1):
+            log(f"typing in {n}...")
+            sleep(1)
+        log(f"typing {text!r}")
+        type_text(kb, kbd_out, text, sleep)
+        log("moving the pointer")
+        wiggle(mouse, mouse_out, sleep)
+    finally:
+        # HID state is sticky: always leave with nothing pressed
+        kbd_out.send(kb.release_all())
+        mouse_out.send(mouse.release_all())
+    log("done")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="USB keyboard and mouse gadget for the Pi.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("gadget", help="create, remove or inspect the USB gadget (needs root)")
+    g.add_argument("action", choices=("up", "down", "status"))
+    g.add_argument("--configfs", default="/sys/kernel/config")
+    g.add_argument("--udc-dir", default="/sys/class/udc")
+    t = sub.add_parser("test", help="type and move the pointer on the connected computer")
+    t.add_argument("--kbd", default="/dev/hidg0")
+    t.add_argument("--mouse", default="/dev/hidg1")
+    t.add_argument("--text", default="Tpkbd test")
+    t.add_argument("--countdown", type=int, default=3)
+    args = ap.parse_args()
+    try:
+        if args.cmd == "gadget":
+            gadget = Gadget(args.configfs, args.udc_dir)
+            if args.action == "status":
+                print(gadget.status())
+            else:
+                getattr(gadget, args.action)()
+        else:
+            kbd, mouse = HidOut.open(args.kbd), HidOut.open(args.mouse)
+            run_test(kbd, mouse, args.text, args.countdown)
+    except (GadgetError, HidError, OSError) as err:
+        sys.exit(f"tpkbd-hid: {err}")
+    except KeyboardInterrupt:
+        sys.exit(130)   # run_test has already released every key
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,17 @@
+[Unit]
+Description=tpkbd USB keyboard and mouse gadget
+After=sys-kernel-config.mount
+ConditionPathExists=/sys/class/udc
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/modprobe libcomposite
+ExecStart=/usr/local/bin/tpkbd-hid gadget up
+ExecStop=/usr/local/bin/tpkbd-hid gadget down
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
