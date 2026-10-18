@@ -1,0 +1,10 @@
+# copy to ~/.config/tpkbd/recv.conf; every line is optional, these are the defaults
+[receiver]
+# pointer speed multiplier: 1.0 sends the ThinkPad's motion as it is. Raise it if the
+# target's pointer feels slow, lower it if it feels fast
+# scale = 1.0
+
+# no data for this many seconds: release every key and button
+# watchdog_s = 3
+# no data for this many seconds: the sender is gone, exit
+# dead_s = 30

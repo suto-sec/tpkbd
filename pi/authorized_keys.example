@@ -1,0 +1,2 @@
+# append to ~/.ssh/authorized_keys on the Pi; tpkbd-pair on the ThinkPad prints this line with the real key
+from="192.168.1.0/24",restrict,pty,command="stty -echo; exec /usr/local/bin/tpkbd-recv" ssh-ed25519 AAAA... tpkbd

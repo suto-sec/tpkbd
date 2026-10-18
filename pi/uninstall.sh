@@ -8,7 +8,7 @@ systemctl disable --now tpkbd-gadget.service 2>/dev/null || true
 rm -f /etc/systemd/system/tpkbd-gadget.service
 rm -f /etc/udev/rules.d/60-tpkbd-hid.rules
 rm -f /etc/modules-load.d/tpkbd.conf
-rm -f /usr/local/bin/tpkbd-hid
+rm -f /usr/local/bin/tpkbd-hid /usr/local/bin/tpkbd-recv
 if getent group tpkbd >/dev/null; then
     groupdel tpkbd
 fi

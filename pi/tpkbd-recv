@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""tpkbd-recv: turn the tpkbd line protocol into USB keyboard and mouse reports.
+
+Reads what tpkbd-send writes (k/m/b/s/g/h lines, see v1/) from stdin and sends it
+to the USB gadget made by tpkbd-hid. Started by the forced command in
+~/.ssh/authorized_keys (pi/authorized_keys.example). Settings (optional):
+~/.config/tpkbd/recv.conf, see pi/recv.conf.example. Standard library only.
+"""
+import configparser
+import importlib.machinery
+import importlib.util
+import os
+import select
+import sys
+import time
+
+PROTO = 2                       # must match tpkbd-send
+CONF_PATH = os.path.expanduser("~/.config/tpkbd/recv.conf")
+
+DEFAULTS = {
+    "scale": "1.0",         # pointer speed on the target, 1.0 = as sent
+    "watchdog_s": "3",      # silence this long: release every key and button
+    "dead_s": "30",         # silence this long: the sender is gone, exit
+}
+
+EV_SYN, EV_KEY = 0, 1
+WHEEL_UNITS = 15            # libinput: 15 scroll units per wheel click
+
+# How long a write may wait for the host. GRUB and many BIOSes never read the mouse
+# interface, so motion is dropped at once instead of stalling the keyboard behind it.
+KEY_WAIT_S = 0.2
+BUTTON_WAIT_S = 0.1         # a lost release would leave the button stuck
+MOTION_WAIT_S = 0
+
+
+def say(msg):
+    print(f"tpkbd-recv: {msg}", file=sys.stderr, flush=True)
+
+
+def load_hid():
+    """tpkbd-hid has no .py extension: load it from next to this script."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "tpkbd-hid")
+    loader = importlib.machinery.SourceFileLoader("tpkbd_hid", path)
+    spec = importlib.util.spec_from_loader("tpkbd_hid", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+hid = load_hid()
+
+
+def load_config(path=CONF_PATH):
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.read_dict({"receiver": DEFAULTS})
+    cp.read(path)  # a missing file just means defaults
+    s = cp["receiver"]
+    return {k: float(s[k]) for k in DEFAULTS}
+
+
+class Replayer:
+    """Protocol lines in, HID reports out. A host that isn't reading is not an error."""
+
+    def __init__(self, kbd_out, mouse_out, cfg):
+        self.kbd_out, self.mouse_out = kbd_out, mouse_out
+        self.scale = cfg["scale"]
+        self.kb = hid.Keyboard()
+        self.mouse = hid.Mouse()
+        self.pending = []           # key events up to the next SYN
+        self.rem_x = self.rem_y = self.rem_v = 0.0
+        self.write_errors = 0
+
+    def release_all(self):
+        """Let go of everything: used when the sender goes quiet or disconnects."""
+        self.pending.clear()
+        for out, report in ((self.kbd_out, self.kb.release_all()),
+                            (self.mouse_out, self.mouse.release_all())):
+            try:
+                out.send(report, BUTTON_WAIT_S)
+            except OSError as err:
+                say(f"release failed: {err}")
+
+    def handle(self, line):
+        p = line.split()
+        if len(p) != 4 or p[0] not in ("k", "m", "b", "s", "g"):
+            return  # includes the "h" heartbeat: it only matters that it arrived
+        try:
+            self._dispatch(p)
+        except (ValueError, OSError) as err:
+            self.write_errors += 1
+            if self.write_errors <= 3:
+                say(f"bad or failed message {line!r}: {err}")
+
+    def _dispatch(self, p):
+        tag = p[0]
+        if tag == "k":
+            t, c, v = int(p[1]), int(p[2]), int(p[3])
+            if t != EV_SYN:
+                if t == EV_KEY:
+                    self.pending.append((c, v))
+                return
+            changed = False
+            for code, value in self.pending:
+                changed |= self.kb.event(code, value)
+            self.pending.clear()
+            if changed:
+                self.kbd_out.send(self.kb.report(), KEY_WAIT_S)
+
+        elif tag == "m":
+            self.rem_x += float(p[1]) * self.scale
+            self.rem_y += float(p[2]) * self.scale
+            dx, dy = int(self.rem_x), int(self.rem_y)
+            self.rem_x -= dx
+            self.rem_y -= dy
+            for report in self.mouse.moves(dx, dy):
+                self.mouse_out.send(report, MOTION_WAIT_S)
+
+        elif tag == "b":
+            report = self.mouse.button(int(p[1]), int(p[2]))
+            if report is not None:
+                self.mouse_out.send(report, BUTTON_WAIT_S)
+
+        elif tag == "s":
+            # libinput: positive is down, HID wheel: positive is up; no horizontal wheel
+            self.rem_v += -float(p[1]) / WHEEL_UNITS
+            clicks = int(self.rem_v)
+            self.rem_v -= clicks
+            for report in self.mouse.moves(0, 0, clicks):
+                self.mouse_out.send(report, MOTION_WAIT_S)
+
+        # "g" (pinch) has no plain-USB equivalent yet: ignored
+
+
+def serve(rp, fd, watchdog_s, dead_s):
+    """Feed lines from `fd` to the replayer until EOF or `dead_s` of silence.
+
+    The sender sends a heartbeat every second, so silence means the link is
+    dead, not that the user is idle."""
+    buf = b""
+    last = time.monotonic()
+    released = True  # nothing pressed yet
+    while True:
+        r, _, _ = select.select([fd], [], [], min(0.5, max(0.01, watchdog_s / 4)))
+        now = time.monotonic()
+        if r:
+            data = os.read(fd, 65536)
+            if not data:
+                break
+            last, released = now, False
+            buf += data
+            *lines, buf = buf.split(b"\n")
+            for raw in lines:
+                rp.handle(raw.decode(errors="replace"))
+            continue
+        idle = now - last
+        if idle >= watchdog_s and not released:
+            say(f"no data for {idle:.0f} s, releasing all keys and buttons")
+            rp.release_all()
+            released = True
+        if idle >= dead_s:
+            say(f"no data for {idle:.0f} s, assuming the sender is gone")
+            break
+    rp.release_all()
+
+
+def main():
+    cfg = load_config()
+    try:
+        kbd_out = hid.HidOut.open("/dev/hidg0")
+        mouse_out = hid.HidOut.open("/dev/hidg1")
+    except hid.HidError as err:
+        sys.exit(f"tpkbd-recv: {err}")
+    print(f"READY {PROTO}", flush=True)
+    serve(Replayer(kbd_out, mouse_out, cfg), 0, cfg["watchdog_s"], cfg["dead_s"])
+
+
+if __name__ == "__main__":
+    main()
