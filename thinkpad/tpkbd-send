@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # tpkbd-send: forward the ThinkPad's keyboard, TrackPoint and touchpad to the PC.
 #
-# Keyboard mode: grabs everything at once. Hold both Ctrl keys and press Esc to
-# stop (exit code 42).
+#   tpkbd-send          keyboard mode: grab everything at once. Hold both Ctrl
+#                       keys and press Esc to stop (exit code 42).
+#   tpkbd-send --soft   desktop mode: nothing is grabbed until the toggle hotkey
+#                       (both Ctrl keys + Space) hands the input to the PC; the
+#                       same hotkey takes it back.
 #
 # Needs read/write access to /dev/input (root, or a user in the "input" group).
 # Settings live in /etc/tpkbd/tpkbd.conf, see thinkpad/tpkbd.conf.example.
@@ -23,6 +26,7 @@ from evdev import ecodes as e
 
 PROTO = 2                       # must match tpkbd-recv
 CONF_PATH = "/etc/tpkbd/tpkbd.conf"
+STATE_PATH = "/run/tpkbd/state"  # "local" or "remote", only written in soft mode
 EXIT_ESCAPE = 42
 
 DEFAULTS = {
@@ -36,6 +40,7 @@ DEFAULTS = {
     # keys that are not forwarded (Fn+4 would suspend the PC)
     "block_keys": "KEY_SLEEP KEY_SUSPEND KEY_WAKEUP KEY_POWER",
     "escape_keys": "KEY_LEFTCTRL KEY_RIGHTCTRL KEY_ESC",
+    "toggle_keys": "KEY_LEFTCTRL KEY_RIGHTCTRL KEY_SPACE",
 }
 
 # libinput debug-events output. Repeated events get a counter column before
@@ -94,6 +99,7 @@ def load_config(path=CONF_PATH):
         "libinput_opts": s["libinput_opts"].split(),
         "block_keys": key_codes(s["block_keys"]),
         "escape_keys": key_codes(s["escape_keys"]),
+        "toggle_keys": key_codes(s["toggle_keys"]),
     }
 
 
@@ -256,8 +262,9 @@ class Link:
 # -------------------------------------------------------------- sender
 
 class Sender:
-    def __init__(self, cfg, link=None):
+    def __init__(self, cfg, soft=False, link=None):
         self.cfg = cfg
+        self.soft = soft
         self.link = link
         self.kbds = []
         self.pointing_paths = []
@@ -265,6 +272,7 @@ class Sender:
         self.master = None
         self.li_buf = b""
         self.state = "local"
+        self.want = None            # "remote"/"local": toggle waiting for all keys up
         self.held = set()           # physical keys currently down
         self.forwarded = set()      # keys the PC currently sees as down
         self.buttons = set()        # pointer buttons the PC sees as down
@@ -346,6 +354,17 @@ class Sender:
 
     # state
 
+    def set_state(self, state):
+        self.state = state
+        if not self.soft:
+            return
+        sd_notify(f"STATUS={state}")
+        try:
+            with open(STATE_PATH, "w") as f:
+                f.write(state + "\n")
+        except OSError:
+            pass
+
     def enter_remote(self):
         self._grab_all()
         try:
@@ -356,7 +375,43 @@ class Sender:
         self.forwarded.clear()
         self.buttons.clear()
         self.batch.clear()
-        self.state = "remote"
+        self.set_state("remote")
+
+    def leave_remote(self):
+        self.link.send(release_lines(self.forwarded, self.buttons, now_us()) +
+                       [f"g e 1 {now_us()}"])
+        self.forwarded.clear()
+        self.buttons.clear()
+        self.batch.clear()
+        self.stop_libinput()
+        self._ungrab_all()
+        self.set_state("local")
+
+    def request_toggle(self):
+        if self.want:
+            return
+        self.want = "local" if self.state == "remote" else "remote"
+        if self.state == "remote":
+            # let go on the PC right away; the grab itself waits for all keys up
+            self.link.send(release_lines(self.forwarded, self.buttons, now_us()))
+            self.forwarded.clear()
+            self.buttons.clear()
+            self.batch.clear()
+        log(f"hotkey: switching to {self.want} once all keys are released")
+
+    def apply_toggle(self):
+        """Grabbing or ungrabbing while a key is down would leave it stuck on one side."""
+        if not self.want or self.held:
+            return
+        want, self.want = self.want, None
+        try:
+            if want == "remote":
+                self.enter_remote()
+            else:
+                self.leave_remote()
+            log(f"input is now {self.state}")
+        except OSError as err:
+            log(f"switching to {want} failed: {err}")
 
     # events
 
@@ -372,10 +427,13 @@ class Sender:
         pressed = ev.value != 0
         (self.held.add if pressed else self.held.discard)(ev.code)
         if pressed:
-            if chord_active(self.cfg["escape_keys"], self.held):
+            if not self.soft and chord_active(self.cfg["escape_keys"], self.held):
                 log("stopped (escape hotkey)")
                 sys.exit(EXIT_ESCAPE)
-        if self.state != "remote" or ev.code in self.cfg["block_keys"]:
+            if self.soft and chord_active(self.cfg["toggle_keys"], self.held):
+                self.request_toggle()
+                return
+        if self.state != "remote" or self.want or ev.code in self.cfg["block_keys"]:
             return
         (self.forwarded.add if pressed else self.forwarded.discard)(ev.code)
         self.batch.append(f"k {ev.type} {ev.code} {ev.value}")
@@ -415,8 +473,10 @@ class Sender:
         self.link = Link(self.cfg)
         self.link.start()
         self.link.wait_ready(self.cfg["ready_timeout"])  # nothing is grabbed before this
-        self.enter_remote()
-        log(f"CONNECTED after {time.monotonic() - t0:.1f} s (hold both Ctrl + Esc to stop)")
+        if not self.soft:
+            self.enter_remote()
+        log(f"CONNECTED after {time.monotonic() - t0:.1f} s " +
+            ("(toggle with the hotkey)" if self.soft else "(hold both Ctrl + Esc to stop)"))
         sd_notify("READY=1\nSTATUS=" + self.state)
         kbd_fds = {d.fd: d for d in self.kbds}
         while True:
@@ -436,6 +496,7 @@ class Sender:
                 else:
                     for ev in kbd_fds[fd].read():
                         self.handle_key(ev)
+            self.apply_toggle()
             self.heartbeat(time.monotonic())
             if self.link.poll() is not None:
                 log("connection lost")
@@ -452,10 +513,14 @@ class Sender:
         self._ungrab_all()
         if self.link is not None:
             self.link.close()
+        if self.soft:
+            self.set_state("local")
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Forward this laptop's input to a PC.")
+    ap.add_argument("--soft", action="store_true",
+                    help="desktop mode: the toggle hotkey switches between local and remote")
     ap.add_argument("--config", default=CONF_PATH)
     args = ap.parse_args(argv)
     try:
@@ -464,7 +529,7 @@ def main(argv=None):
         sys.exit(f"tpkbd: bad config {args.config}: {err}")
     # exit through `finally` on systemctl stop; 0 tells tpkbd-screen to restore the panel
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    sender = Sender(cfg)
+    sender = Sender(cfg, soft=args.soft)
     try:
         sender.run()
     except LinkError as err:

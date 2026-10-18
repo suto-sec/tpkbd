@@ -46,8 +46,8 @@ class OfflineSender(send.Sender):
         pass
 
 
-def make(state="local", conf=None):
-    s = OfflineSender(send.load_config(conf or "/nonexistent"), link=FakeLink())
+def make(soft=False, state="local", conf=None):
+    s = OfflineSender(send.load_config(conf or "/nonexistent"), soft=soft, link=FakeLink())
     if state == "remote":
         s.enter_remote()
     return s
@@ -103,6 +103,7 @@ class Config(unittest.TestCase):
         self.assertEqual(cfg["host"], "tpkbd-pc")
         self.assertIn("TrackPoint", cfg["pointing"])
         self.assertIn(e.KEY_SLEEP, cfg["block_keys"])
+        self.assertEqual(cfg["toggle_keys"], {e.KEY_LEFTCTRL, e.KEY_RIGHTCTRL, e.KEY_SPACE})
 
     def test_override(self):
         with tempfile.NamedTemporaryFile("w", suffix=".conf") as f:
@@ -115,7 +116,7 @@ class Config(unittest.TestCase):
 
     def test_unknown_key_name(self):
         with tempfile.NamedTemporaryFile("w", suffix=".conf") as f:
-            f.write("[sender]\nblock_keys = KEY_NOPE\n")
+            f.write("[sender]\ntoggle_keys = KEY_NOPE\n")
             f.flush()
             with self.assertRaises(ValueError):
                 send.load_config(f.name)
@@ -224,6 +225,104 @@ class KeyboardMode(unittest.TestCase):
         s.shutdown()
         self.assertEqual(s.link.sent[:2], ["k 1 29 0", "k 1 97 0"])
         self.assertFalse(s.grabbed)
+
+    def test_toggle_chord_does_nothing_in_keyboard_mode(self):
+        s = make(state="remote")
+        for code in (e.KEY_LEFTCTRL, e.KEY_RIGHTCTRL, e.KEY_SPACE):
+            tap(s, code, 1)
+        self.assertIsNone(s.want)
+        self.assertIn(e.KEY_SPACE, s.forwarded)
+
+
+class SoftToggle(unittest.TestCase):
+    def chord(self, s):
+        for code in (e.KEY_LEFTCTRL, e.KEY_RIGHTCTRL, e.KEY_SPACE):
+            tap(s, code, 1)
+
+    def release(self, s, *codes):
+        for code in codes:
+            tap(s, code, 0)
+
+    def test_local_keys_are_not_forwarded(self):
+        s = make(soft=True)
+        tap(s, e.KEY_A, 1)
+        self.assertEqual(s.link.sent, [])
+
+    def test_escape_chord_is_ignored_in_soft_mode(self):
+        s = make(soft=True)
+        for code in (e.KEY_LEFTCTRL, e.KEY_RIGHTCTRL, e.KEY_ESC):
+            tap(s, code, 1)  # must not exit
+
+    def test_grab_waits_until_every_key_is_up(self):
+        s = make(soft=True)
+        self.chord(s)
+        self.assertEqual(s.want, "remote")
+        s.apply_toggle()
+        self.assertEqual((s.state, s.grabbed), ("local", False))
+        self.release(s, e.KEY_SPACE, e.KEY_RIGHTCTRL)
+        s.apply_toggle()
+        self.assertEqual(s.state, "local")  # Ctrl is still down
+        self.release(s, e.KEY_LEFTCTRL)
+        s.apply_toggle()
+        self.assertEqual((s.state, s.grabbed, s.want), ("remote", True, None))
+        self.assertEqual(s.link.sent, [])  # the chord never reached the PC
+
+    def test_back_to_local_releases_what_the_pc_saw(self):
+        s = make(soft=True, state="remote")
+        tap(s, e.KEY_A, 1)                    # held while the chord is pressed
+        s.link.sent.clear()
+        self.chord(s)
+        self.assertEqual(s.want, "local")
+        # the first two chord keys had already reached the PC; all of them are let go,
+        # and the completing key (Space) never gets there
+        self.assertEqual([x for x in s.link.sent if x.endswith(" 0") and x.startswith("k 1")],
+                         ["k 1 29 0", "k 1 30 0", "k 1 97 0"])
+        self.assertNotIn("k 1 57 1", s.link.sent)
+        self.assertNotIn(e.KEY_SPACE, s.forwarded)
+        s.link.sent.clear()
+        self.release(s, e.KEY_SPACE, e.KEY_RIGHTCTRL, e.KEY_LEFTCTRL)
+        self.assertEqual(s.link.sent, [])     # releases are suppressed while switching
+        self.assertEqual(s.state, "remote")   # key A is still down
+        self.release(s, e.KEY_A)
+        s.apply_toggle()
+        self.assertEqual((s.state, s.grabbed), ("local", False))
+        self.assertTrue(any(x.startswith("g e 1") for x in s.link.sent))
+
+    def test_mouse_buttons_are_released_when_leaving(self):
+        s = make(soft=True, state="remote")
+        s.buttons.add(272)
+        self.chord(s)
+        self.assertIn("b 272 0", " ".join(s.link.sent))
+        self.assertEqual(s.buttons, set())
+
+    def test_failed_grab_stays_local(self):
+        s = make(soft=True)
+
+        def busy():
+            raise OSError("device busy")
+        s._grab_all = busy
+        logged = []
+        send.log, old = logged.append, send.log
+        try:
+            self.chord(s)
+            self.release(s, e.KEY_SPACE, e.KEY_RIGHTCTRL, e.KEY_LEFTCTRL)
+            s.apply_toggle()
+        finally:
+            send.log = old
+        self.assertEqual((s.state, s.want), ("local", None))
+        self.assertTrue(any("failed" in m for m in logged))
+
+    def test_state_is_published(self):
+        s = make(soft=True)
+        with tempfile.TemporaryDirectory() as d:
+            send.STATE_PATH, old = os.path.join(d, "state"), send.STATE_PATH
+            try:
+                s.set_state("remote")
+                with open(send.STATE_PATH) as f:
+                    self.assertEqual(f.read(), "remote\n")
+            finally:
+                send.STATE_PATH = old
+
 
 class Heartbeat(unittest.TestCase):
     def test_sent_on_schedule(self):

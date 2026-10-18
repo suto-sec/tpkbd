@@ -1,0 +1,34 @@
+[Unit]
+Description=tpkbd: hotkey toggle between this laptop and the PC (desktop stays up)
+Wants=network-online.target
+After=network-online.target
+Conflicts=tpkbd-forward.service
+StartLimitIntervalSec=0
+
+[Service]
+# Nothing is grabbed until the toggle hotkey is pressed. Current side:
+#   systemctl status tpkbd-soft     or     cat /run/tpkbd/state
+Type=notify
+User=tpkbd
+SupplementaryGroups=input
+RuntimeDirectory=tpkbd
+ExecStart=/usr/local/bin/tpkbd-send --soft
+Restart=always
+RestartSec=3
+# on stop only tpkbd-send gets SIGTERM, so it can release everything over ssh
+KillMode=mixed
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+UMask=0077
