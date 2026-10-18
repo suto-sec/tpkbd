@@ -1,7 +1,20 @@
 #!/bin/sh
-# tpkbd-screen off|post: power the internal panel off in keyboard mode.
-# "post" only restores it after Ctrl+Ctrl+Esc (42) or a shutdown, not on retries.
-SAVE=/run/tpkbd-brightness
+# tpkbd-screen pre|off|post: power the internal panel off in keyboard mode.
+# Run by tpkbd-forward.service (as root, via the "+" prefix).
+#
+#   off   after the sender has connected: backlight to 0, connector forced off
+#   post  after the sender exited: restore after Ctrl+Ctrl+Esc (42), a clean
+#         stop (0) or a shutdown (TERM/INT); after a failure only note the time
+#   pre   before each (re)start: if the PC has been gone for TPKBD_SCREEN_GIVEUP
+#         seconds (default 300), restore the panel so the laptop isn't a dark brick
+OFF=/run/tpkbd-off              # exists while the panel is forced off by us
+SAVE=/run/tpkbd-brightness      # one file per backlight device: $SAVE.<name>
+LOST=/run/tpkbd-lost            # when the connection was lost (epoch seconds)
+GIVEUP=${TPKBD_SCREEN_GIVEUP:-300}
+
+is_off() {
+    [ -e "$OFF" ]
+}
 
 restore() {
     for s in /sys/class/drm/card*-eDP-*/status; do
@@ -9,27 +22,51 @@ restore() {
     done
     sleep 1
     for b in /sys/class/backlight/*; do
-        if [ -f "$SAVE" ]; then cat "$SAVE" > "$b/brightness"
-        else cat "$b/max_brightness" > "$b/brightness"; fi
+        [ -d "$b" ] || continue
+        value=""
+        [ -f "$SAVE.${b##*/}" ] && value=$(cat "$SAVE.${b##*/}")
+        # a saved 0 would bring the panel back black
+        case "$value" in
+            ""|0) value=$(cat "$b/max_brightness") ;;
+        esac
+        echo "$value" > "$b/brightness"
     done
-    rm -f "$SAVE"
+    rm -f "$OFF" "$SAVE".* "$LOST"
 }
 
 case "$1" in
+pre)
+    if is_off && [ -f "$LOST" ]; then
+        lost=$(cat "$LOST")
+        now=$(date +%s)
+        if [ $((now - lost)) -ge "$GIVEUP" ]; then
+            restore
+        fi
+    fi
+    ;;
 off)
-    sleep 2
-    chvt 1
+    # on a reconnect the panel is already off: skip the wait and the vt switch
+    if ! is_off; then
+        sleep 2     # let the desktop finish closing
+        chvt 1
+        : > "$OFF"
+    fi
     for b in /sys/class/backlight/*; do
-        [ -f "$SAVE" ] || cat "$b/brightness" > "$SAVE"
+        [ -d "$b" ] || continue
+        [ -f "$SAVE.${b##*/}" ] || cat "$b/brightness" > "$SAVE.${b##*/}"
         echo 0 > "$b/brightness"
     done
     for s in /sys/class/drm/card*-eDP-*/status; do
         [ -e "$s" ] && echo off > "$s"
     done
+    rm -f "$LOST"
     ;;
 post)
     case "$EXIT_STATUS" in
-        42|TERM|INT) restore ;;
+        # only undo what "off" did: a stop while the PC was never reached must
+        # not push the brightness to maximum
+        0|42|TERM|INT) if is_off; then restore; fi ;;
+        *) if is_off && [ ! -f "$LOST" ]; then date +%s > "$LOST"; fi ;;
     esac
     ;;
 esac
