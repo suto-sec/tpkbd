@@ -5,8 +5,11 @@ on:
   pull_request:
 
 jobs:
-  test:
+  v1:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: v1
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
