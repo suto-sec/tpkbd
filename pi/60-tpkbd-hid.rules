@@ -1,0 +1,2 @@
+# let members of the tpkbd group write HID reports without root
+KERNEL=="hidg[0-9]*", GROUP="tpkbd", MODE="0660"
