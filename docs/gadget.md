@@ -31,8 +31,8 @@ then `sudo reboot`. Keep `dtoverlay=dwc2` in `config.txt`, and keep Wi-Fi on: it
 From the ThinkPad, in the repo folder:
 
 ```bash
-scp -r pi <user>@<host>.local:tpkbd-pi
-ssh <user>@<host>.local
+scp -r pi <user>@<pi-ip>:tpkbd-pi
+ssh <user>@<pi-ip>
 ```
 
 On the Pi:
@@ -98,10 +98,27 @@ Plug the Pi's USB port into the target PC instead, with the Pi powered from its 
 
 This is the check that proves the whole point of v2. Report what you see: which BIOS, whether it saw the keyboard, and whether the mouse did anything.
 
+## 6. Type from the ThinkPad (over Wi-Fi, for now)
+
+`tpkbd-recv` on the Pi reads the same line protocol as v1 and turns it into USB reports, so the v1 sender (`tpkbd-send`, its systemd units and `tpkbd-pair`) works against the Pi unchanged. The link is SSH over Wi-Fi until the UART wire exists. The sender is installed as in [v1/docs/setup.md](../v1/docs/setup.md):
+
+1. On the Pi, copy the current `pi/` folder over and run `sudo ./tpkbd-pi/install.sh` again (section 2). An older install doesn't have `tpkbd-recv`.
+2. On the ThinkPad, run `sudo v1/thinkpad/install.sh` if v1 isn't installed yet. If `/etc/tpkbd/ssh_config` already exists the installer keeps it and doesn't ask for an address: edit `HostName` and `User` in it (with sudo) to the Pi's. The sender talks to one host, so v1 to the old target stops working until you change them back.
+3. With the Pi on, run `sudo tpkbd-pair` on the ThinkPad. Compare the fingerprint with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the Pi, and append the line it prints to `~/.ssh/authorized_keys` on the Pi (an example is in `pi/authorized_keys.example`).
+4. Plug the Pi into the target (section 5), then on the ThinkPad run `sudo tpkbd-send`. **Expected:** the ThinkPad's keyboard and TrackPoint now drive the target. Left Ctrl + Right Ctrl + Esc stops it.
+
+Differences from v1: no pinch gestures, no horizontal scroll, and the pointer speed is `scale` in `~/.config/tpkbd/recv.conf` on the Pi (see `pi/recv.conf.example`).
+
+## 7. Boot the ThinkPad straight into keyboard mode (GRUB)
+
+Do this only after step 4 of section 6 works by hand. Keyboard mode closes the desktop and turns the panel off; soft mode (`tpkbd-soft`) keeps the desktop and toggles with a hotkey. To start in keyboard mode at boot, add a GRUB entry that boots your normal entry with `systemd.unit=tpkbd-mode.target`. The commands are in [v1/docs/setup.md](../v1/docs/setup.md#18-optional-grub-entry); change `'Arch Linux'` in the first command to the title of your own entry (`grep ^menuentry /boot/grub/grub.cfg`). Your normal entry stays in the menu, so nothing is lost if keyboard mode fails. No user session logs in, so Wi-Fi has to be available system-wide ([v1/docs/setup.md](../v1/docs/setup.md) section 10).
+
+Keep a way back: the entry runs without a desktop. The sender grabs the ThinkPad's keyboard as soon as the Pi's receiver answers, even if the Pi isn't plugged into a target, so the keys then go nowhere. Left Ctrl + Right Ctrl + Esc stops it. If the Pi is off or unreachable the sender never grabs the keyboard, and the panel stays on.
+
 ## Known limits of this milestone
 
 - The keyboard is a boot-protocol keyboard: 6 keys at once plus modifiers. A seventh key makes it report "too many keys" until one is released.
 - Media and Fn keys (volume, brightness) aren't mapped: they need a different report.
 - The mouse has a vertical wheel but no horizontal one.
 - There is no pinch-to-zoom.
-- The ThinkPad isn't connected to the Pi's keyboard yet: that comes next, and needs the USB-to-TTL adapter (or the temporary Wi-Fi link) to carry the events.
+- The link from the ThinkPad is SSH over Wi-Fi for now. The wired UART link needs a 3.3 V USB-to-TTL adapter and isn't built yet.
