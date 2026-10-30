@@ -5,9 +5,10 @@
   tpkbd-hid test                     type a few letters and wiggle the pointer on
                                      whatever computer the Pi is plugged into
 
-The gadget has two separate HID functions (keyboard -> /dev/hidg0, mouse ->
-/dev/hidg1) without report IDs, in the standard boot-protocol layouts, so BIOS
-and bootloaders accept them. Standard library only.
+The gadget has three separate HID functions without report IDs: keyboard
+(/dev/hidg0) and mouse (/dev/hidg1) in the standard boot-protocol layouts, so BIOS
+and bootloaders accept them, and consumer control (/dev/hidg2) for media keys.
+Standard library only.
 """
 import argparse
 import errno
@@ -31,15 +32,26 @@ KBD_DESC = bytes([
 ])
 KBD_REPORT_LEN = 8
 
-# Boot mouse (3 buttons, X, Y) plus a wheel byte. A boot-protocol host reads the first three bytes.
+# Boot mouse (3 buttons, X, Y) plus a wheel byte and a horizontal wheel (AC Pan) byte.
+# A boot-protocol host reads the first three bytes and ignores the rest.
 MOUSE_DESC = bytes([
     0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, 0x05, 0x09,
     0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01,
     0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x03, 0x05, 0x01, 0x09, 0x30,
     0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03,
-    0x81, 0x06, 0xC0, 0xC0,
+    0x81, 0x06,
+    0x05, 0x0C, 0x0A, 0x38, 0x02, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95,
+    0x01, 0x81, 0x06,    # Consumer page, AC Pan
+    0xC0, 0xC0,
 ])
-MOUSE_REPORT_LEN = 4
+MOUSE_REPORT_LEN = 5
+
+# Consumer control: one 16-bit usage at a time (0 = nothing pressed).
+CONSUMER_DESC = bytes([
+    0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x15, 0x00, 0x26, 0xFF, 0x03, 0x19,
+    0x00, 0x2A, 0xFF, 0x03, 0x75, 0x10, 0x95, 0x01, 0x81, 0x00, 0xC0,
+])
+CONSUMER_REPORT_LEN = 2
 
 # Linux evdev key codes (input-event-codes.h) -> HID keyboard usages (usage page 0x07)
 
@@ -90,6 +102,22 @@ for _row, _first in (("qwertyuiop", 16), ("asdfghjkl", 30), ("zxcvbnm", 44)):
 CHAR_KEY = {chr(ord("a") + (u - 0x04)): code for code, u in KEY_USAGE.items() if 0x04 <= u <= 0x1D}
 CHAR_KEY[" "] = KEY_SPACE
 
+# evdev media keys -> HID consumer usages (usage page 0x0C)
+CONSUMER_USAGE = {
+    113: 0xE2,      # KEY_MUTE
+    114: 0xEA,      # KEY_VOLUMEDOWN
+    115: 0xE9,      # KEY_VOLUMEUP
+    163: 0xB5,      # KEY_NEXTSONG
+    164: 0xCD,      # KEY_PLAYPAUSE
+    165: 0xB6,      # KEY_PREVIOUSSONG
+    166: 0xB7,      # KEY_STOPCD
+    224: 0x70,      # KEY_BRIGHTNESSDOWN
+    225: 0x6F,      # KEY_BRIGHTNESSUP
+    140: 0x192,     # KEY_CALC
+    155: 0x18A,     # KEY_MAIL
+    172: 0x223,     # KEY_HOMEPAGE
+}
+
 BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 272, 273, 274
 BUTTON_BITS = {BTN_LEFT: 0x01, BTN_RIGHT: 0x02, BTN_MIDDLE: 0x04}
 
@@ -111,6 +139,7 @@ class Keyboard:
 
     def __init__(self):
         self.mods = 0
+        self.virtual_mods = 0   # held on behalf of a gesture, not by a physical key
         self.keys = []      # HID usages in press order
 
     def event(self, code, value):
@@ -137,22 +166,50 @@ class Keyboard:
             slots = [ROLLOVER] * 6
         else:
             slots = self.keys + [0] * (6 - len(self.keys))
-        return bytes([self.mods, 0] + slots)
+        return bytes([self.mods | self.virtual_mods, 0] + slots)
 
     def release_all(self):
         self.mods = 0
+        self.virtual_mods = 0
         self.keys.clear()
         return self.report()
 
 
+class Consumer:
+    """Held media keys -> 2-byte consumer reports (the latest key pressed wins)."""
+
+    def __init__(self):
+        self.held = []      # usages in press order
+
+    def event(self, code, value):
+        """Apply an evdev key event; True if the report changed."""
+        usage = CONSUMER_USAGE.get(code)
+        if usage is None or value == 2:
+            return False
+        if value and usage not in self.held:
+            self.held.append(usage)
+            return True
+        if not value and usage in self.held:
+            self.held.remove(usage)
+            return True
+        return False
+
+    def report(self):
+        return struct.pack("<H", self.held[-1] if self.held else 0)
+
+    def release_all(self):
+        self.held.clear()
+        return self.report()
+
+
 class Mouse:
-    """Relative motion, buttons and wheel -> 4-byte reports."""
+    """Relative motion, buttons, wheel and horizontal wheel -> 5-byte reports."""
 
     def __init__(self):
         self.buttons = 0
 
-    def _pack(self, dx=0, dy=0, wheel=0):
-        return struct.pack("Bbbb", self.buttons, dx, dy, wheel)
+    def _pack(self, dx=0, dy=0, wheel=0, pan=0):
+        return struct.pack("Bbbbb", self.buttons, dx, dy, wheel, pan)
 
     def button(self, code, value):
         """Report for a button event, or None if `code` isn't a mouse button."""
@@ -162,13 +219,13 @@ class Mouse:
         self.buttons = (self.buttons | bit) if value else (self.buttons & ~bit)
         return self._pack()
 
-    def moves(self, dx, dy, wheel=0):
+    def moves(self, dx, dy, wheel=0, pan=0):
         """Reports for a motion; large deltas are split into several reports."""
         out = []
-        while dx or dy or wheel:
-            sx, sy, sw = (max(-127, min(127, v)) for v in (dx, dy, wheel))
-            out.append(self._pack(sx, sy, sw))
-            dx, dy, wheel = dx - sx, dy - sy, wheel - sw
+        while dx or dy or wheel or pan:
+            sx, sy, sw, sp = (max(-127, min(127, v)) for v in (dx, dy, wheel, pan))
+            out.append(self._pack(sx, sy, sw, sp))
+            dx, dy, wheel, pan = dx - sx, dy - sy, wheel - sw, pan - sp
         return out
 
     def release_all(self):
@@ -271,11 +328,13 @@ class Gadget:
         self._put(f"configs/c.1/strings/{LANG}/configuration", "HID")
         self._put("configs/c.1/MaxPower", 100)
         self._put("configs/c.1/bmAttributes", "0xA0")   # bus powered, remote wakeup
-        for name, protocol, length, desc in (("hid.usb0", 1, KBD_REPORT_LEN, KBD_DESC),
-                                             ("hid.usb1", 2, MOUSE_REPORT_LEN, MOUSE_DESC)):
+        for name, protocol, subclass, length, desc in (
+                ("hid.usb0", 1, 1, KBD_REPORT_LEN, KBD_DESC),
+                ("hid.usb1", 2, 1, MOUSE_REPORT_LEN, MOUSE_DESC),
+                ("hid.usb2", 0, 0, CONSUMER_REPORT_LEN, CONSUMER_DESC)):     # not a boot interface
             self._mkdir(f"functions/{name}")
             self._put(f"functions/{name}/protocol", protocol)
-            self._put(f"functions/{name}/subclass", 1)      # boot interface
+            self._put(f"functions/{name}/subclass", subclass)
             self._put(f"functions/{name}/report_length", length)
             self._put(f"functions/{name}/report_desc", desc)
             os.symlink(os.path.join(self.root, "functions", name),
@@ -295,7 +354,7 @@ class Gadget:
                 if os.path.islink(os.path.join(cfg, name)):
                     os.unlink(os.path.join(cfg, name))
         for rel in (f"configs/c.1/strings/{LANG}", "configs/c.1", "functions/hid.usb0",
-                    "functions/hid.usb1", f"strings/{LANG}", ""):
+                    "functions/hid.usb1", "functions/hid.usb2", f"strings/{LANG}", ""):
             self._rmdir(rel)
 
     def status(self):

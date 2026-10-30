@@ -1,7 +1,7 @@
 # copy to /etc/tpkbd/tpkbd.conf; every line is optional, these are the defaults
 [sender]
 # how the input reaches the receiver: "ssh" (a Linux PC running tpkbd-recv) or
-# "serial" (the UART wire to the Pi, see docs/gadget.md section 7 at the repo root)
+# "serial" (the UART wire to the Pi, see v2/docs/wired.md at the repo root)
 # link = ssh
 # serial_port = /dev/ttyUSB0
 # baud = 115200

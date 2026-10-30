@@ -31,6 +31,7 @@ class Descriptors(unittest.TestCase):
     def test_report_lengths_match_the_descriptors(self):
         self.assertEqual(input_bytes(hid.KBD_DESC), hid.KBD_REPORT_LEN)
         self.assertEqual(input_bytes(hid.MOUSE_DESC), hid.MOUSE_REPORT_LEN)
+        self.assertEqual(input_bytes(hid.CONSUMER_DESC), hid.CONSUMER_REPORT_LEN)
 
     def test_descriptors_are_closed(self):
         self.assertEqual(hid.KBD_DESC[-1], 0xC0)
@@ -138,12 +139,70 @@ class KeyboardReports(unittest.TestCase):
         self.assertEqual(self.kb.report(), bytes(8))
 
 
+class ConsumerReports(unittest.TestCase):
+    def setUp(self):
+        self.c = hid.Consumer()
+
+    def test_idle(self):
+        self.assertEqual(self.c.report(), bytes(2))
+
+    def test_press_and_release_volume_up(self):
+        self.assertTrue(self.c.event(115, 1))
+        self.assertEqual(self.c.report(), bytes([0xE9, 0]))
+        self.assertTrue(self.c.event(115, 0))
+        self.assertEqual(self.c.report(), bytes(2))
+
+    def test_two_byte_usage_is_little_endian(self):
+        self.c.event(140, 1)    # calculator, usage 0x0192
+        self.assertEqual(self.c.report(), bytes([0x92, 0x01]))
+
+    def test_latest_key_wins_and_the_older_one_comes_back(self):
+        self.c.event(114, 1)
+        self.c.event(115, 1)
+        self.assertEqual(self.c.report(), bytes([0xE9, 0]))
+        self.c.event(115, 0)
+        self.assertEqual(self.c.report(), bytes([0xEA, 0]))
+
+    def test_repeats_and_other_keys_change_nothing(self):
+        self.c.event(115, 1)
+        self.assertFalse(self.c.event(115, 2))
+        self.assertFalse(self.c.event(30, 1))       # KEY_A is not a media key
+        self.assertFalse(self.c.event(113, 0))      # mute was never pressed
+
+    def test_release_all(self):
+        self.c.event(113, 1)
+        self.assertEqual(self.c.release_all(), bytes(2))
+
+    def test_no_media_key_is_also_a_keyboard_key(self):
+        self.assertFalse(set(hid.CONSUMER_USAGE) & set(hid.KEY_USAGE))
+        self.assertFalse(set(hid.CONSUMER_USAGE) & set(hid.MODIFIER_BITS))
+
+
+class VirtualModifiers(unittest.TestCase):
+    def test_a_held_virtual_ctrl_shows_in_the_report(self):
+        kb = hid.Keyboard()
+        kb.virtual_mods = 0x01
+        self.assertEqual(kb.report(), bytes([0x01, 0, 0, 0, 0, 0, 0, 0]))
+
+    def test_it_combines_with_real_modifiers(self):
+        kb = hid.Keyboard()
+        kb.event(42, 1)     # left shift
+        kb.virtual_mods = 0x01
+        self.assertEqual(kb.report()[0], 0x03)
+
+    def test_release_all_drops_it(self):
+        kb = hid.Keyboard()
+        kb.virtual_mods = 0x01
+        self.assertEqual(kb.release_all(), bytes(8))
+        self.assertEqual(kb.virtual_mods, 0)
+
+
 class MouseReports(unittest.TestCase):
     def setUp(self):
         self.m = hid.Mouse()
 
     def test_small_move(self):
-        self.assertEqual(self.m.moves(5, -3), [bytes([0, 5, 253, 0])])
+        self.assertEqual(self.m.moves(5, -3), [bytes([0, 5, 253, 0, 0])])
 
     def test_no_motion_no_report(self):
         self.assertEqual(self.m.moves(0, 0), [])
@@ -155,23 +214,33 @@ class MouseReports(unittest.TestCase):
         total_y = sum(int.from_bytes(r[2:3], "little", signed=True) for r in reports)
         self.assertEqual((total_x, total_y), (300, -200))
         for r in reports:
-            self.assertEqual(len(r), 4)
+            self.assertEqual(len(r), 5)
             self.assertGreater(int.from_bytes(r[1:2], "little", signed=True), -128)
 
     def test_wheel(self):
-        self.assertEqual(self.m.moves(0, 0, -1), [bytes([0, 0, 0, 255])])
+        self.assertEqual(self.m.moves(0, 0, -1), [bytes([0, 0, 0, 255, 0])])
 
     def test_buttons(self):
-        self.assertEqual(self.m.button(hid.BTN_LEFT, 1), bytes([1, 0, 0, 0]))
-        self.assertEqual(self.m.button(hid.BTN_RIGHT, 1), bytes([3, 0, 0, 0]))
-        self.assertEqual(self.m.moves(1, 0), [bytes([3, 1, 0, 0])])     # held while moving
-        self.assertEqual(self.m.button(hid.BTN_LEFT, 0), bytes([2, 0, 0, 0]))
+        self.assertEqual(self.m.button(hid.BTN_LEFT, 1), bytes([1, 0, 0, 0, 0]))
+        self.assertEqual(self.m.button(hid.BTN_RIGHT, 1), bytes([3, 0, 0, 0, 0]))
+        self.assertEqual(self.m.moves(1, 0), [bytes([3, 1, 0, 0, 0])])     # held while moving
+        self.assertEqual(self.m.button(hid.BTN_LEFT, 0), bytes([2, 0, 0, 0, 0]))
         self.assertIsNone(self.m.button(999, 1))
+
+    def test_horizontal_wheel(self):
+        self.assertEqual(self.m.moves(0, 0, 0, 2), [bytes([0, 0, 0, 0, 2])])
+        self.assertEqual(self.m.moves(0, 0, 0, -1), [bytes([0, 0, 0, 0, 255])])
+
+    def test_wheel_and_pan_together_and_split(self):
+        reports = self.m.moves(0, 0, 200, -130)
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(sum(int.from_bytes(r[3:4], "little", signed=True) for r in reports), 200)
+        self.assertEqual(sum(int.from_bytes(r[4:5], "little", signed=True) for r in reports), -130)
 
     def test_release_all(self):
         self.m.button(hid.BTN_MIDDLE, 1)
-        self.assertEqual(self.m.release_all(), bytes(4))
-        self.assertEqual(self.m.moves(1, 1), [bytes([0, 1, 1, 0])])
+        self.assertEqual(self.m.release_all(), bytes(5))
+        self.assertEqual(self.m.moves(1, 1), [bytes([0, 1, 1, 0, 0])])
 
 
 class HidOutTests(unittest.TestCase):
@@ -247,7 +316,7 @@ class SelfTest(unittest.TestCase):
         kbd, mouse = Recorder(), Recorder()
         self.run_it(kbd, mouse, countdown=0)
         self.assertEqual(kbd.reports[-1], bytes(8))
-        self.assertEqual(mouse.reports[-1], bytes(4))
+        self.assertEqual(mouse.reports[-1], bytes(5))
 
     def test_the_pointer_comes_back_to_where_it_started(self):
         kbd, mouse = Recorder(), Recorder()
@@ -263,7 +332,7 @@ class SelfTest(unittest.TestCase):
         with self.assertRaisesRegex(hid.HidError, "isn't reading"):
             self.run_it(kbd, mouse, countdown=0)
         self.assertEqual(kbd.reports[-1], bytes(8))
-        self.assertEqual(mouse.reports[-1], bytes(4))
+        self.assertEqual(mouse.reports[-1], bytes(5))
 
     def test_rejects_characters_it_cannot_type(self):
         with self.assertRaisesRegex(hid.HidError, "can't type"):
@@ -287,7 +356,7 @@ class FakeGadgetTests(unittest.TestCase):
         with open(os.path.join(self.g.root, rel), mode) as f:
             return f.read()
 
-    def test_up_writes_both_functions(self):
+    def test_up_writes_all_three_functions(self):
         self.g.up()
         self.assertEqual(self.read("functions/hid.usb0/protocol"), "1")
         self.assertEqual(self.read("functions/hid.usb0/subclass"), "1")
@@ -295,12 +364,17 @@ class FakeGadgetTests(unittest.TestCase):
         self.assertEqual(self.read("functions/hid.usb0/report_desc", "rb"), hid.KBD_DESC)
         self.assertEqual(self.read("functions/hid.usb1/protocol"), "2")
         self.assertEqual(self.read("functions/hid.usb1/subclass"), "1")
-        self.assertEqual(self.read("functions/hid.usb1/report_length"), "4")
+        self.assertEqual(self.read("functions/hid.usb1/report_length"), "5")
         self.assertEqual(self.read("functions/hid.usb1/report_desc", "rb"), hid.MOUSE_DESC)
+        # media keys: a plain (non-boot) interface
+        self.assertEqual(self.read("functions/hid.usb2/protocol"), "0")
+        self.assertEqual(self.read("functions/hid.usb2/subclass"), "0")
+        self.assertEqual(self.read("functions/hid.usb2/report_length"), "2")
+        self.assertEqual(self.read("functions/hid.usb2/report_desc", "rb"), hid.CONSUMER_DESC)
 
     def test_functions_are_linked_into_the_config(self):
         self.g.up()
-        for name in ("hid.usb0", "hid.usb1"):
+        for name in ("hid.usb0", "hid.usb1", "hid.usb2"):
             link = os.path.join(self.g.root, "configs", "c.1", name)
             self.assertTrue(os.path.islink(link))
             self.assertEqual(os.readlink(link), os.path.join(self.g.root, "functions", name))
@@ -321,7 +395,7 @@ class FakeGadgetTests(unittest.TestCase):
         self.assertEqual(self.read("UDC"), "a.usb")
         links = [n for n in os.listdir(os.path.join(self.g.root, "configs", "c.1"))
                  if n.startswith("hid.")]
-        self.assertEqual(sorted(links), ["hid.usb0", "hid.usb1"])
+        self.assertEqual(sorted(links), ["hid.usb0", "hid.usb1", "hid.usb2"])
 
     def test_down_removes_it(self):
         self.g.up()
@@ -345,7 +419,7 @@ class FakeGadgetTests(unittest.TestCase):
         with mock.patch.object(hid.os, "unlink", side_effect=unlink):
             self.g.down()
         self.assertEqual(order[0], ("UDC", "\n"))
-        self.assertEqual([o[0] for o in order].count("unlink"), 2)
+        self.assertEqual([o[0] for o in order].count("unlink"), 3)
 
     def test_status(self):
         self.assertEqual(self.g.status(), "down")

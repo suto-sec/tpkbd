@@ -17,6 +17,7 @@ import argparse
 import configparser
 import importlib.machinery
 import importlib.util
+import math
 import os
 import select
 import sys
@@ -28,12 +29,14 @@ CONF_PATH = os.path.expanduser("~/.config/tpkbd/recv.conf")
 
 DEFAULTS = {
     "scale": "1.0",         # pointer speed on the target, 1.0 = as sent
+    "pinch_clicks": "6",    # Ctrl+wheel clicks per doubling of the pinch distance
     "watchdog_s": "3",      # silence this long: release every key and button
     "dead_s": "30",         # silence this long: the sender is gone, exit
 }
 
 EV_SYN, EV_KEY = 0, 1
 WHEEL_UNITS = 15            # libinput: 15 scroll units per wheel click
+CTRL = 0x01                 # left Ctrl, held while a pinch turns into Ctrl+wheel
 
 # How long a write may wait for the host. GRUB and many BIOSes never read the mouse
 # interface, so motion is dropped at once instead of stalling the keyboard behind it.
@@ -70,21 +73,30 @@ def load_config(path=CONF_PATH):
 class Replayer:
     """Protocol lines in, HID reports out. A host that isn't reading is not an error."""
 
-    def __init__(self, kbd_out, mouse_out, cfg, reply=None):
+    def __init__(self, kbd_out, mouse_out, cfg, reply=None, consumer_out=None):
         self.kbd_out, self.mouse_out = kbd_out, mouse_out
+        self.consumer_out = consumer_out    # media keys; None if the gadget predates them
         self.reply = reply          # writes a line back to the sender (serial mode only)
         self.scale = cfg["scale"]
+        self.pinch_clicks = cfg.get("pinch_clicks", 6.0)
         self.kb = hid.Keyboard()
         self.mouse = hid.Mouse()
+        self.consumer = hid.Consumer()
         self.pending = []           # key events up to the next SYN
-        self.rem_x = self.rem_y = self.rem_v = 0.0
+        self.rem_x = self.rem_y = self.rem_v = self.rem_h = 0.0
+        self.pinching = False
+        self.pinch_sent = 0         # wheel clicks already sent for the current pinch
         self.write_errors = 0
 
     def release_all(self):
         """Let go of everything: used when the sender goes quiet or disconnects."""
         self.pending.clear()
-        for out, report in ((self.kbd_out, self.kb.release_all()),
-                            (self.mouse_out, self.mouse.release_all())):
+        self.pinching = False
+        outs = [(self.kbd_out, self.kb.release_all()),
+                (self.mouse_out, self.mouse.release_all())]
+        if self.consumer_out is not None:
+            outs.append((self.consumer_out, self.consumer.release_all()))
+        for out, report in outs:
             try:
                 out.send(report, BUTTON_WAIT_S)
             except OSError as err:
@@ -116,12 +128,15 @@ class Replayer:
                 if t == EV_KEY:
                     self.pending.append((c, v))
                 return
-            changed = False
+            changed = media = False
             for code, value in self.pending:
                 changed |= self.kb.event(code, value)
+                media |= self.consumer.event(code, value)
             self.pending.clear()
             if changed:
                 self.kbd_out.send(self.kb.report(), KEY_WAIT_S)
+            if media and self.consumer_out is not None:
+                self.consumer_out.send(self.consumer.report(), KEY_WAIT_S)
 
         elif tag == "m":
             self.rem_x += float(p[1]) * self.scale
@@ -138,14 +153,46 @@ class Replayer:
                 self.mouse_out.send(report, BUTTON_WAIT_S)
 
         elif tag == "s":
-            # libinput: positive is down, HID wheel: positive is up; no horizontal wheel
+            # libinput: vertical positive is down but the HID wheel is positive up;
+            # horizontal is positive to the right on both
             self.rem_v += -float(p[1]) / WHEEL_UNITS
-            clicks = int(self.rem_v)
+            self.rem_h += float(p[2]) / WHEEL_UNITS
+            clicks, pans = int(self.rem_v), int(self.rem_h)
             self.rem_v -= clicks
-            for report in self.mouse.moves(0, 0, clicks):
+            self.rem_h -= pans
+            for report in self.mouse.moves(0, 0, clicks, pans):
                 self.mouse_out.send(report, MOTION_WAIT_S)
 
-        # "g" (pinch) has no plain-USB equivalent yet: ignored
+        elif tag == "g":
+            # A plain USB mouse can't pinch, so a pinch becomes Ctrl + wheel, which
+            # zooms in browsers, editors and most viewers.
+            if p[1] == "b":
+                self.pinching, self.pinch_sent = True, 0
+            elif p[1] == "u":
+                self.pinch_update(float(p[2]))
+            elif p[1] == "e":
+                self.pinch_end()
+
+    def pinch_update(self, scale):
+        if scale <= 0:
+            raise ValueError(f"pinch scale {scale}")
+        self.pinching = True
+        target = round(math.log2(scale) * self.pinch_clicks)
+        delta = target - self.pinch_sent
+        if not delta:
+            return
+        if not self.kb.virtual_mods & CTRL:
+            self.kb.virtual_mods |= CTRL
+            self.kbd_out.send(self.kb.report(), KEY_WAIT_S)
+        self.pinch_sent = target
+        for report in self.mouse.moves(0, 0, delta):    # spreading fingers (scale > 1) is up: zoom in
+            self.mouse_out.send(report, MOTION_WAIT_S)
+
+    def pinch_end(self):
+        self.pinching = False
+        if self.kb.virtual_mods & CTRL:
+            self.kb.virtual_mods &= ~CTRL
+            self.kbd_out.send(self.kb.report(), KEY_WAIT_S)
 
 
 def serve(rp, fd, watchdog_s, dead_s):
@@ -231,13 +278,20 @@ def main():
         mouse_out = hid.HidOut.open("/dev/hidg1")
     except hid.HidError as err:
         sys.exit(f"tpkbd-recv: {err}")
+    try:
+        consumer_out = hid.HidOut.open("/dev/hidg2")
+    except hid.HidError:
+        consumer_out = None
+        say("no /dev/hidg2: media keys are off until the gadget is recreated (re-run pi/install.sh, reboot)")
     if args.serial:
         fd = open_serial(args.serial, args.baud)
         say(f"listening on {args.serial} at {args.baud} baud")
-        serve(Replayer(kbd_out, mouse_out, cfg, reply=serial_reply(fd)), fd, cfg["watchdog_s"], 0)
+        serve(Replayer(kbd_out, mouse_out, cfg, reply=serial_reply(fd), consumer_out=consumer_out),
+              fd, cfg["watchdog_s"], 0)
         return
     print(f"READY {PROTO}", flush=True)
-    serve(Replayer(kbd_out, mouse_out, cfg), 0, cfg["watchdog_s"], cfg["dead_s"])
+    serve(Replayer(kbd_out, mouse_out, cfg, consumer_out=consumer_out),
+          0, cfg["watchdog_s"], cfg["dead_s"])
 
 
 if __name__ == "__main__":

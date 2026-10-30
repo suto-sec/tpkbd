@@ -72,7 +72,7 @@ class Keys(unittest.TestCase):
         rp.handle("b 272 1 1")
         rp.release_all()
         self.assertEqual(kbd.reports[-1], bytes(8))
-        self.assertEqual(mouse.reports[-1], bytes(4))
+        self.assertEqual(mouse.reports[-1], bytes(5))
 
     def test_release_all_drops_half_a_frame(self):
         rp, kbd, _ = make()
@@ -86,7 +86,7 @@ class Pointer(unittest.TestCase):
     def test_motion(self):
         rp, _, mouse = make()
         rp.handle("m 3 -2 1")
-        self.assertEqual(mouse.reports, [bytes([0, 3, 0xFE, 0])])
+        self.assertEqual(mouse.reports, [bytes([0, 3, 0xFE, 0, 0])])
 
     def test_fractions_accumulate(self):
         rp, _, mouse = make()
@@ -97,7 +97,7 @@ class Pointer(unittest.TestCase):
     def test_scale(self):
         rp, _, mouse = make(scale=2.0)
         rp.handle("m 3 0 1")
-        self.assertEqual(mouse.reports, [bytes([0, 6, 0, 0])])
+        self.assertEqual(mouse.reports, [bytes([0, 6, 0, 0, 0])])
 
     def test_large_motion_is_split(self):
         rp, _, mouse = make()
@@ -119,20 +119,153 @@ class Pointer(unittest.TestCase):
     def test_scroll_down_is_negative_wheel(self):
         rp, _, mouse = make()
         rp.handle("s 15 0 1")       # one click down
-        self.assertEqual(mouse.reports, [bytes([0, 0, 0, 0xFF])])
+        self.assertEqual(mouse.reports, [bytes([0, 0, 0, 0xFF, 0])])
 
     def test_scroll_up_and_accumulation(self):
         rp, _, mouse = make()
         for _ in range(3):
             rp.handle("s -5 0 1")   # three fifths of a click each, upward
-        self.assertEqual(mouse.reports, [bytes([0, 0, 0, 1])])
+        self.assertEqual(mouse.reports, [bytes([0, 0, 0, 1, 0])])
 
-    def test_gesture_and_heartbeat_are_ignored(self):
+    def test_heartbeat_is_ignored(self):
         rp, kbd, mouse = make()
-        rp.handle("g b 1 1")
-        rp.handle("g u 1.5 1")
         rp.handle("h 12345")
         self.assertEqual((kbd.reports, mouse.reports), ([], []))
+
+    def test_scroll_right_and_left(self):
+        rp, _, mouse = make()
+        rp.handle("s 0 15 1")       # one click to the right
+        rp.handle("s 0 -15 1")
+        self.assertEqual(mouse.reports, [bytes([0, 0, 0, 0, 1]), bytes([0, 0, 0, 0, 0xFF])])
+
+    def test_diagonal_scroll_is_one_report(self):
+        rp, _, mouse = make()
+        rp.handle("s 15 15 1")
+        self.assertEqual(mouse.reports, [bytes([0, 0, 0, 0xFF, 1])])
+
+    def test_horizontal_fractions_accumulate(self):
+        rp, _, mouse = make()
+        for _ in range(3):
+            rp.handle("s 0 5 1")
+        self.assertEqual(mouse.reports, [bytes([0, 0, 0, 0, 1])])
+
+
+class MediaKeys(unittest.TestCase):
+    def make(self, **kw):
+        consumer = FakeOut()
+        kbd, mouse = FakeOut(), FakeOut()
+        return recv.Replayer(kbd, mouse, {**CFG, **kw}, consumer_out=consumer), kbd, consumer
+
+    def test_volume_up_goes_to_the_consumer_device(self):
+        rp, kbd, consumer = self.make()
+        key(rp, 115, 1)
+        key(rp, 115, 0)
+        self.assertEqual(consumer.reports, [bytes([0xE9, 0]), bytes(2)])
+        self.assertEqual(kbd.reports, [])
+
+    def test_ordinary_keys_stay_on_the_keyboard(self):
+        rp, kbd, consumer = self.make()
+        key(rp, 30, 1)
+        self.assertEqual(len(kbd.reports), 1)
+        self.assertEqual(consumer.reports, [])
+
+    def test_without_the_device_media_keys_are_dropped(self):
+        rp, kbd, _ = make()
+        key(rp, 115, 1)
+        self.assertEqual(kbd.reports, [])
+
+    def test_release_all_releases_media_keys(self):
+        rp, _, consumer = self.make()
+        key(rp, 115, 1)
+        rp.release_all()
+        self.assertEqual(consumer.reports[-1], bytes(2))
+
+    def test_media_key_and_letter_in_one_frame(self):
+        rp, kbd, consumer = self.make()
+        rp.handle("k 1 115 1")
+        rp.handle("k 1 30 1")
+        rp.handle("k 0 0 1")
+        self.assertEqual((len(kbd.reports), len(consumer.reports)), (1, 1))
+
+
+class Pinch(unittest.TestCase):
+    CTRL_DOWN = bytes([0x01, 0, 0, 0, 0, 0, 0, 0])
+
+    def clicks(self, mouse):
+        return [int.from_bytes(r[3:4], "little", signed=True) for r in mouse.reports]
+
+    def test_spreading_zooms_in_with_ctrl_held(self):
+        rp, kbd, mouse = make(pinch_clicks=6.0)
+        rp.handle("g b 1 1")
+        rp.handle("g u 2.0 1")          # doubled: 6 clicks up
+        self.assertEqual(kbd.reports, [self.CTRL_DOWN])
+        self.assertEqual(sum(self.clicks(mouse)), 6)
+        rp.handle("g e 1 1")
+        self.assertEqual(kbd.reports[-1], bytes(8))
+
+    def test_pinching_zooms_out(self):
+        rp, kbd, mouse = make(pinch_clicks=6.0)
+        rp.handle("g b 1 1")
+        rp.handle("g u 0.5 1")
+        self.assertEqual(sum(self.clicks(mouse)), -6)
+
+    def test_updates_send_only_the_difference(self):
+        rp, _, mouse = make(pinch_clicks=6.0)
+        rp.handle("g b 1 1")
+        for scale in (1.1, 1.2, 1.4, 2.0):
+            rp.handle(f"g u {scale} 1")
+        self.assertEqual(sum(self.clicks(mouse)), 6)
+
+    def test_small_changes_do_not_press_ctrl(self):
+        rp, kbd, _ = make(pinch_clicks=6.0)
+        rp.handle("g b 1 1")
+        rp.handle("g u 1.02 1")
+        self.assertEqual(kbd.reports, [])
+
+    def test_ctrl_is_pressed_once(self):
+        rp, kbd, _ = make(pinch_clicks=6.0)
+        rp.handle("g b 1 1")
+        rp.handle("g u 1.5 1")
+        rp.handle("g u 2.0 1")
+        self.assertEqual(kbd.reports.count(self.CTRL_DOWN), 1)
+
+    def test_it_combines_with_a_held_real_modifier(self):
+        rp, kbd, _ = make(pinch_clicks=6.0)
+        key(rp, 42, 1)                  # shift
+        rp.handle("g b 1 1")
+        rp.handle("g u 2.0 1")
+        self.assertEqual(kbd.reports[-1][0], 0x03)
+        rp.handle("g e 1 1")
+        self.assertEqual(kbd.reports[-1][0], 0x02)      # shift stays down
+
+    def test_a_new_pinch_starts_from_scratch(self):
+        rp, _, mouse = make(pinch_clicks=6.0)
+        for _ in range(2):
+            rp.handle("g b 1 1")
+            rp.handle("g u 2.0 1")
+            rp.handle("g e 1 1")
+        self.assertEqual(sum(self.clicks(mouse)), 12)
+
+    def test_release_all_lets_go_of_ctrl(self):
+        rp, kbd, _ = make(pinch_clicks=6.0)
+        rp.handle("g b 1 1")
+        rp.handle("g u 2.0 1")
+        rp.release_all()
+        self.assertEqual(kbd.reports[-1], bytes(8))
+        rp.handle("g e 1 1")            # a late end changes nothing
+        self.assertEqual(kbd.reports[-1], bytes(8))
+
+    def test_nonsense_scale_is_ignored(self):
+        rp, kbd, mouse = make()
+        with mock.patch.object(recv, "say"):
+            rp.handle("g u 0 1")
+            rp.handle("g u -1 1")
+        self.assertEqual((kbd.reports, mouse.reports), ([], []))
+
+    def test_update_without_begin_still_works(self):
+        rp, _, mouse = make(pinch_clicks=6.0)
+        rp.handle("g u 2.0 1")
+        self.assertEqual(sum(self.clicks(mouse)), 6)
 
 
 class BadInput(unittest.TestCase):
@@ -205,7 +338,7 @@ class Gone(unittest.TestCase):
 class Config(unittest.TestCase):
     def test_defaults_without_a_file(self):
         cfg = recv.load_config("/nonexistent/recv.conf")
-        self.assertEqual(cfg, {"scale": 1.0, "watchdog_s": 3.0, "dead_s": 30.0})
+        self.assertEqual(cfg, {"scale": 1.0, "pinch_clicks": 6.0, "watchdog_s": 3.0, "dead_s": 30.0})
 
     def test_override(self):
         with tempfile.TemporaryDirectory() as d:
@@ -234,7 +367,7 @@ class Serve(unittest.TestCase):
 
         kbd, mouse = self.run_serve(feed)
         self.assertEqual(kbd.reports[-1], bytes(8))
-        self.assertEqual(mouse.reports[-1], bytes(4))
+        self.assertEqual(mouse.reports[-1], bytes(5))
 
     def test_lines_split_across_reads(self):
         def feed(w):

@@ -10,7 +10,7 @@ from tests.loader import load
 
 recv = load("pi/tpkbd-recv")
 try:
-    send = load("v1/thinkpad/tpkbd-send")
+    send = load("../v1/thinkpad/tpkbd-send")
 except ImportError:     # python-evdev isn't installed
     send = None
 
@@ -89,7 +89,7 @@ class Wire(unittest.TestCase):
         self.link.send(["k 1 30 1", "k 0 0 1", "k 1 30 0", "k 0 0 2", "b 272 1 3"])
         self.assertTrue(self.wait_for(lambda: len(self.kbd.reports) == 2 and self.mouse.reports))
         self.assertEqual(self.kbd.reports, [bytes([0, 0, 0x04, 0, 0, 0, 0, 0]), bytes(8)])
-        self.assertEqual(self.mouse.reports, [bytes([1, 0, 0, 0])])
+        self.assertEqual(self.mouse.reports, [bytes([1, 0, 0, 0, 0])])
 
     def test_receiver_started_late_still_answers(self):
         # the sender keeps saying hello until somebody listens

@@ -2,6 +2,8 @@
 Description=tpkbd: USB keyboard and mouse driven from the UART wire
 After=tpkbd-gadget.service
 Wants=tpkbd-gadget.service
+# restarting the gadget recreates /dev/hidg*: the receiver must reopen them
+PartOf=tpkbd-gadget.service
 StartLimitIntervalSec=0
 
 [Service]

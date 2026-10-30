@@ -3,7 +3,7 @@
 #
 #   sudo ./install.sh
 #
-# It does not touch /boot/firmware: dtoverlay=dwc2 in config.txt is a manual step (docs/gadget.md).
+# It does not touch /boot/firmware: dtoverlay=dwc2 in config.txt is a manual step (v2/docs/pi-setup.md).
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -48,12 +48,13 @@ fi
 udevadm control --reload
 systemctl daemon-reload
 systemctl enable tpkbd-gadget.service tpkbd-recv.service
+# restarting the gadget also restarts tpkbd-recv (PartOf=), so it reopens /dev/hidg* and runs the new code
 if systemctl restart tpkbd-gadget.service; then
     echo "gadget: $(/usr/local/bin/tpkbd-hid gadget status)"
 else
     echo "the gadget failed to start: journalctl -u tpkbd-gadget" >&2
     exit 1
 fi
-echo "Next: plug the Pi's USB port into a computer and run: tpkbd-hid test (see docs/gadget.md)"
-echo "Then, to type from the ThinkPad: docs/gadget.md section 6 (Wi-Fi) or 7 (the wire)."
-echo "tpkbd-recv.service is enabled but not started: set up the UART first (section 7)."
+echo "Next: plug the Pi's USB port into a computer and run: tpkbd-hid test (see v2/docs/pi-setup.md)"
+echo "Then, to type from the ThinkPad: v2/docs/wired.md (the wire) or v2/docs/wifi.md (Wi-Fi)."
+echo "tpkbd-recv.service is enabled but not started: set up the UART first (v2/docs/wired.md)."

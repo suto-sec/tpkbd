@@ -94,7 +94,7 @@ systemctl enable tpkbd-forward.service
 if [[ $SERIAL -eq 1 ]]; then
     echo
     echo "Serial link ready (port: serial_port in /etc/tpkbd/tpkbd.conf, default /dev/ttyUSB0)."
-    echo "Test with: sudo tpkbd-send    (docs/gadget.md section 7 at the repo root)"
+    echo "Test with: sudo tpkbd-send    (v2/docs/wired.md at the repo root)"
     echo "Then either keyboard mode or soft mode:"
     echo "  sudo systemctl isolate tpkbd-mode.target    or    sudo systemctl start tpkbd-soft"
     exit 0

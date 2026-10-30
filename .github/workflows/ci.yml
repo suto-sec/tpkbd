@@ -23,6 +23,9 @@ jobs:
         run: python3 -m unittest discover -s tests -t .
   v2:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: v2
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
@@ -33,6 +36,6 @@ jobs:
       - name: python-evdev, for the wire tests
         run: sudo apt-get install -y -qq python3-evdev
       - name: compile the scripts
-        run: python3 -m py_compile pi/tpkbd-hid pi/tpkbd-recv v1/thinkpad/tpkbd-send
+        run: python3 -m py_compile pi/tpkbd-hid pi/tpkbd-recv ../v1/thinkpad/tpkbd-send
       - name: tests
         run: python3 -m unittest discover -s tests -t .
