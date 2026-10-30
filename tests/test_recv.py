@@ -190,6 +190,18 @@ class Stalls(unittest.TestCase):
         self.assertEqual(len(kbd.reports), 1)
 
 
+class Gone(unittest.TestCase):
+    def test_a_vanished_port_releases_and_returns(self):
+        rp, kbd, mouse = make()
+        r, w = os.pipe()
+        os.write(w, b"k 1 30 1\nk 0 0 1\n")
+        os.close(w)
+        os.close(r)     # reading a closed descriptor: EBADF, like a port that went away
+        with mock.patch.object(recv, "say"):
+            recv.serve(rp, r, 0.1, 0)
+        self.assertEqual(kbd.reports[-1], bytes(8))
+
+
 class Config(unittest.TestCase):
     def test_defaults_without_a_file(self):
         cfg = recv.load_config("/nonexistent/recv.conf")

@@ -10,6 +10,12 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# --serial: the receiver is the Pi on the UART wire, so no ssh key or address is needed
+SERIAL=0
+if [[ "${1:-}" == "--serial" ]]; then
+    SERIAL=1
+fi
+
 if command -v pacman >/dev/null 2>&1; then
     pacman -S --needed --noconfirm python-evdev openssh libinput
 fi
@@ -24,16 +30,26 @@ if ! id tpkbd >/dev/null 2>&1; then
             --shell "$(command -v nologin || echo /usr/bin/nologin)" tpkbd
 fi
 usermod -aG input tpkbd
+# serial ports belong to uucp (Arch) or dialout (Debian and friends)
+for grp in uucp dialout; do
+    if getent group "$grp" >/dev/null; then
+        usermod -aG "$grp" tpkbd
+    fi
+done
 
 install -d -m 700 /etc/tpkbd
 
-if [[ ! -f /etc/tpkbd/id_ed25519 ]]; then
+if [[ $SERIAL -eq 1 ]]; then
+    echo "--serial: skipping the ssh key and address"
+elif [[ ! -f /etc/tpkbd/id_ed25519 ]]; then
     ssh-keygen -t ed25519 -N "" -C tpkbd -f /etc/tpkbd/id_ed25519
 else
     echo "/etc/tpkbd/id_ed25519 already exists, keeping it"
 fi
 
-if [[ ! -f /etc/tpkbd/ssh_config ]]; then
+if [[ $SERIAL -eq 1 ]]; then
+    :
+elif [[ ! -f /etc/tpkbd/ssh_config ]]; then
     read -rp "Receiver's IP address: " receiver_ip
     read -rp "Receiver's username: " receiver_user
     # the values go into sed replacements: refuse anything that could break them
@@ -53,16 +69,36 @@ if [[ ! -f /etc/tpkbd/tpkbd.conf ]]; then
     install -m 644 "$SCRIPT_DIR/tpkbd.conf.example" /etc/tpkbd/tpkbd.conf
 fi
 
+if [[ $SERIAL -eq 1 ]]; then
+    if grep -q '^[[:space:]]*link[[:space:]]*=' /etc/tpkbd/tpkbd.conf; then
+        sed -i 's|^[[:space:]]*link[[:space:]]*=.*|link = serial|' /etc/tpkbd/tpkbd.conf
+    else
+        sed -i '/^\[sender\]/a link = serial' /etc/tpkbd/tpkbd.conf
+    fi
+    echo "set link = serial in /etc/tpkbd/tpkbd.conf"
+fi
+
 # older installs left these root-owned; the service user has to read them
 chown -R tpkbd:tpkbd /etc/tpkbd
 chmod 700 /etc/tpkbd
-chmod 600 /etc/tpkbd/id_ed25519 /etc/tpkbd/ssh_config
+if [[ $SERIAL -eq 0 ]]; then
+    chmod 600 /etc/tpkbd/id_ed25519 /etc/tpkbd/ssh_config
+fi
 
 install -m 644 "$SCRIPT_DIR/tpkbd-mode.target" /etc/systemd/system/tpkbd-mode.target
 install -m 644 "$SCRIPT_DIR/tpkbd-forward.service" /etc/systemd/system/tpkbd-forward.service
 install -m 644 "$SCRIPT_DIR/tpkbd-soft.service" /etc/systemd/system/tpkbd-soft.service
 systemctl daemon-reload
 systemctl enable tpkbd-forward.service
+
+if [[ $SERIAL -eq 1 ]]; then
+    echo
+    echo "Serial link ready (port: serial_port in /etc/tpkbd/tpkbd.conf, default /dev/ttyUSB0)."
+    echo "Test with: sudo tpkbd-send    (docs/gadget.md section 7 at the repo root)"
+    echo "Then either keyboard mode or soft mode:"
+    echo "  sudo systemctl isolate tpkbd-mode.target    or    sudo systemctl start tpkbd-soft"
+    exit 0
+fi
 
 echo
 echo "Remaining manual steps (see docs/setup.md):"

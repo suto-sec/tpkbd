@@ -15,7 +15,7 @@ class Ev:
 
 
 class FakeLink:
-    proc = True
+    started = True
     eof = False
 
     def __init__(self):

@@ -18,9 +18,16 @@ if [ -d /sys/module/g_ether ]; then
 fi
 
 getent group tpkbd >/dev/null || groupadd --system tpkbd
+# the UART service runs as its own user: tpkbd for /dev/hidg*, dialout for the serial port
+id tpkbd >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /nonexistent \
+    --gid tpkbd --shell /usr/sbin/nologin tpkbd
+usermod -aG dialout tpkbd
+install -d -m 755 /etc/tpkbd
+[ -f /etc/tpkbd/recv.conf ] || install -m 644 "$here/recv.conf.example" /etc/tpkbd/recv.conf
 install -m 755 "$here/tpkbd-hid" /usr/local/bin/tpkbd-hid
 install -m 755 "$here/tpkbd-recv" /usr/local/bin/tpkbd-recv
 install -m 644 "$here/tpkbd-gadget.service" /etc/systemd/system/tpkbd-gadget.service
+install -m 644 "$here/tpkbd-recv.service" /etc/systemd/system/tpkbd-recv.service
 install -m 644 "$here/60-tpkbd-hid.rules" /etc/udev/rules.d/60-tpkbd-hid.rules
 install -m 644 "$here/tpkbd-modules.conf" /etc/modules-load.d/tpkbd.conf
 
@@ -40,7 +47,7 @@ fi
 
 udevadm control --reload
 systemctl daemon-reload
-systemctl enable tpkbd-gadget.service
+systemctl enable tpkbd-gadget.service tpkbd-recv.service
 if systemctl restart tpkbd-gadget.service; then
     echo "gadget: $(/usr/local/bin/tpkbd-hid gadget status)"
 else
@@ -48,4 +55,5 @@ else
     exit 1
 fi
 echo "Next: plug the Pi's USB port into a computer and run: tpkbd-hid test (see docs/gadget.md)"
-echo "Then, to type from the ThinkPad: docs/gadget.md section 6"
+echo "Then, to type from the ThinkPad: docs/gadget.md section 6 (Wi-Fi) or 7 (the wire)."
+echo "tpkbd-recv.service is enabled but not started: set up the UART first (section 7)."

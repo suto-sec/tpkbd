@@ -4,11 +4,16 @@ set -eu
 
 [ "$(id -u)" -eq 0 ] || { echo "run with sudo: sudo $0" >&2; exit 1; }
 
+systemctl disable --now tpkbd-recv.service 2>/dev/null || true
 systemctl disable --now tpkbd-gadget.service 2>/dev/null || true
+rm -f /etc/systemd/system/tpkbd-recv.service
 rm -f /etc/systemd/system/tpkbd-gadget.service
 rm -f /etc/udev/rules.d/60-tpkbd-hid.rules
 rm -f /etc/modules-load.d/tpkbd.conf
 rm -f /usr/local/bin/tpkbd-hid /usr/local/bin/tpkbd-recv
+if id tpkbd >/dev/null 2>&1; then
+    userdel tpkbd
+fi
 if getent group tpkbd >/dev/null; then
     groupdel tpkbd
 fi

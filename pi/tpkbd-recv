@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 """tpkbd-recv: turn the tpkbd line protocol into USB keyboard and mouse reports.
 
-Reads what tpkbd-send writes (k/m/b/s/g/h lines, see v1/) from stdin and sends it
-to the USB gadget made by tpkbd-hid. Started by the forced command in
-~/.ssh/authorized_keys (pi/authorized_keys.example). Settings (optional):
-~/.config/tpkbd/recv.conf, see pi/recv.conf.example. Standard library only.
+Reads what tpkbd-send writes (k/m/b/s/g/h lines, see v1/) and sends it to the USB
+gadget made by tpkbd-hid.
+
+  tpkbd-recv                   read stdin: started by the forced command in
+                               ~/.ssh/authorized_keys (pi/authorized_keys.example)
+  tpkbd-recv --serial PATH     read the UART wire; runs forever as a service
+                               (pi/tpkbd-recv.service). Answers `hello` with READY
+                               and every heartbeat with `ok`.
+
+Settings (optional): ~/.config/tpkbd/recv.conf or --config, see pi/recv.conf.example.
+Standard library only.
 """
+import argparse
 import configparser
 import importlib.machinery
 import importlib.util
 import os
 import select
 import sys
+import termios
 import time
 
 PROTO = 2                       # must match tpkbd-send
@@ -61,8 +70,9 @@ def load_config(path=CONF_PATH):
 class Replayer:
     """Protocol lines in, HID reports out. A host that isn't reading is not an error."""
 
-    def __init__(self, kbd_out, mouse_out, cfg):
+    def __init__(self, kbd_out, mouse_out, cfg, reply=None):
         self.kbd_out, self.mouse_out = kbd_out, mouse_out
+        self.reply = reply          # writes a line back to the sender (serial mode only)
         self.scale = cfg["scale"]
         self.kb = hid.Keyboard()
         self.mouse = hid.Mouse()
@@ -82,6 +92,13 @@ class Replayer:
 
     def handle(self, line):
         p = line.split()
+        if self.reply is not None:
+            if p == ["hello"]:
+                self.reply(f"READY {PROTO}")
+                return
+            if p[:1] == ["h"]:
+                self.reply("ok")
+                return
         if len(p) != 4 or p[0] not in ("k", "m", "b", "s", "g"):
             return  # includes the "h" heartbeat: it only matters that it arrived
         try:
@@ -132,7 +149,7 @@ class Replayer:
 
 
 def serve(rp, fd, watchdog_s, dead_s):
-    """Feed lines from `fd` to the replayer until EOF or `dead_s` of silence.
+    """Feed lines from `fd` to the replayer until EOF or `dead_s` of silence (0: never give up).
 
     The sender sends a heartbeat every second, so silence means the link is
     dead, not that the user is idle."""
@@ -140,10 +157,20 @@ def serve(rp, fd, watchdog_s, dead_s):
     last = time.monotonic()
     released = True  # nothing pressed yet
     while True:
-        r, _, _ = select.select([fd], [], [], min(0.5, max(0.01, watchdog_s / 4)))
+        try:
+            r, _, _ = select.select([fd], [], [], min(0.5, max(0.01, watchdog_s / 4)))
+        except OSError as err:
+            say(f"port failed: {err}")
+            break
         now = time.monotonic()
         if r:
-            data = os.read(fd, 65536)
+            try:
+                data = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            except OSError as err:
+                say(f"read failed: {err}")
+                break
             if not data:
                 break
             last, released = now, False
@@ -157,19 +184,58 @@ def serve(rp, fd, watchdog_s, dead_s):
             say(f"no data for {idle:.0f} s, releasing all keys and buttons")
             rp.release_all()
             released = True
-        if idle >= dead_s:
+        if dead_s and idle >= dead_s:
             say(f"no data for {idle:.0f} s, assuming the sender is gone")
             break
     rp.release_all()
 
 
+def open_serial(path, baud):
+    """Open a serial port raw, 8N1, no flow control, non-blocking."""
+    speed = getattr(termios, f"B{baud}", None)
+    if speed is None:
+        sys.exit(f"tpkbd-recv: unsupported baud rate {baud}")
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        attrs = termios.tcgetattr(fd)
+        attrs[0] = attrs[1] = attrs[3] = 0
+        attrs[2] = ((attrs[2] & ~(termios.CSIZE | termios.PARENB | termios.CSTOPB | termios.CRTSCTS))
+                    | termios.CS8 | termios.CLOCAL | termios.CREAD)
+        attrs[4] = attrs[5] = speed
+        attrs[6][termios.VMIN] = attrs[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        termios.tcflush(fd, termios.TCIOFLUSH)
+    except (OSError, termios.error) as err:
+        sys.exit(f"tpkbd-recv: cannot use {path}: {err}")
+    return fd
+
+
+def serial_reply(fd):
+    def reply(text):
+        try:
+            os.write(fd, (text + "\n").encode())
+        except OSError:
+            pass    # the sender is gone or the buffer is full: it will ask again
+    return reply
+
+
 def main():
-    cfg = load_config()
+    ap = argparse.ArgumentParser(description="Turn tpkbd protocol lines into USB HID reports.")
+    ap.add_argument("--serial", metavar="PATH", help="read this serial port instead of stdin")
+    ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--config", default=CONF_PATH)
+    args = ap.parse_args()
+    cfg = load_config(args.config)
     try:
         kbd_out = hid.HidOut.open("/dev/hidg0")
         mouse_out = hid.HidOut.open("/dev/hidg1")
     except hid.HidError as err:
         sys.exit(f"tpkbd-recv: {err}")
+    if args.serial:
+        fd = open_serial(args.serial, args.baud)
+        say(f"listening on {args.serial} at {args.baud} baud")
+        serve(Replayer(kbd_out, mouse_out, cfg, reply=serial_reply(fd)), fd, cfg["watchdog_s"], 0)
+        return
     print(f"READY {PROTO}", flush=True)
     serve(Replayer(kbd_out, mouse_out, cfg), 0, cfg["watchdog_s"], cfg["dead_s"])
 

@@ -1,0 +1,33 @@
+[Unit]
+Description=tpkbd: USB keyboard and mouse driven from the UART wire
+After=tpkbd-gadget.service
+Wants=tpkbd-gadget.service
+StartLimitIntervalSec=0
+
+[Service]
+# Runs for good: the ThinkPad's sender connects and disconnects at will, and the
+# receiver lets go of every key when the wire goes quiet.
+User=tpkbd
+Group=tpkbd
+SupplementaryGroups=dialout
+ExecStart=/usr/local/bin/tpkbd-recv --serial /dev/serial0 --config /etc/tpkbd/recv.conf
+Restart=always
+RestartSec=3
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

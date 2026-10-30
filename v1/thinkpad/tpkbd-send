@@ -19,6 +19,7 @@ import signal
 import socket
 import subprocess
 import sys
+import termios
 import time
 
 import evdev
@@ -30,8 +31,11 @@ STATE_PATH = "/run/tpkbd/state"  # "local" or "remote", only written in soft mod
 EXIT_ESCAPE = 42
 
 DEFAULTS = {
+    "link": "ssh",                  # "ssh" (receiver on a PC) or "serial" (wire to the Pi)
     "ssh_config": "/etc/tpkbd/ssh_config",
     "host": "tpkbd-pc",
+    "serial_port": "/dev/ttyUSB0",
+    "baud": "115200",
     "ready_timeout": "15",
     "heartbeat_s": "1",
     "keyboard": "AT Translated Set 2 keyboard, ThinkPad Extra Buttons",
@@ -89,9 +93,16 @@ def load_config(path=CONF_PATH):
     cp.read_dict({"sender": DEFAULTS})
     cp.read(path)  # a missing file just means defaults
     s = cp["sender"]
+    if s["link"] not in ("ssh", "serial"):
+        raise ValueError(f"link must be ssh or serial, not {s['link']!r}")
+    if not hasattr(termios, f"B{int(s['baud'])}"):
+        raise ValueError(f"unsupported baud rate {s['baud']}")
     return {
+        "link": s["link"],
         "ssh_config": s["ssh_config"],
         "host": s["host"],
+        "serial_port": s["serial_port"],
+        "baud": int(s["baud"]),
         "ready_timeout": float(s["ready_timeout"]),
         "heartbeat_s": float(s["heartbeat_s"]),
         "keyboard": split_names(s["keyboard"]),
@@ -188,10 +199,19 @@ class Link:
         self.eof = False
         self._buf = b""
 
+    NUDGE_S = 1.0       # wait_ready calls nudge() this often while waiting
+
+    @property
+    def started(self):
+        return self.proc is not None
+
     def start(self):
         self.proc = subprocess.Popen(self.argv, stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, bufsize=0)
         self.fd = self.proc.stdout.fileno()
+
+    def nudge(self):
+        """Ask the receiver to announce itself again: not needed over ssh, it starts on connect."""
 
     def poll(self):
         return self.proc.poll()
@@ -223,8 +243,9 @@ class Link:
             left = deadline - time.monotonic()
             if left <= 0:
                 raise LinkError("PC not reachable or receiver not ready (will retry)")
-            r, _, _ = select.select([self.fd], [], [], left)
+            r, _, _ = select.select([self.fd], [], [], min(left, self.NUDGE_S))
             if not r:
+                self.nudge()
                 continue
             for line in self.read_lines():
                 m = re.fullmatch(r"READY(?: (\d+))?", line)
@@ -257,6 +278,117 @@ class Link:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
         self.proc.stdout.close()
+
+
+def open_serial(path, baud):
+    """Open a serial port raw, 8N1, no flow control, non-blocking."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError as err:
+        raise LinkError(f"cannot open {path}: {err.strerror}") from err
+    try:
+        attrs = termios.tcgetattr(fd)
+        speed = getattr(termios, f"B{baud}")
+        attrs[0] = attrs[1] = attrs[3] = 0
+        attrs[2] = ((attrs[2] & ~(termios.CSIZE | termios.PARENB | termios.CSTOPB | termios.CRTSCTS))
+                    | termios.CS8 | termios.CLOCAL | termios.CREAD)
+        attrs[4] = attrs[5] = speed
+        attrs[6][termios.VMIN] = attrs[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        termios.tcflush(fd, termios.TCIOFLUSH)
+    except (termios.error, OSError) as err:
+        os.close(fd)
+        raise LinkError(f"cannot set up {path}: {err}") from err
+    return fd
+
+
+class SerialLink(Link):
+    """The wire to tpkbd-recv on the Pi. The receiver is already running, so the sender
+    says `hello` until it answers READY, and the receiver answers every heartbeat with
+    `ok` so a dead Pi is noticed."""
+
+    DEAD_S = 5.0
+    NUDGE_S = 0.5
+
+    def __init__(self, cfg):
+        super().__init__(cfg, argv=[])
+        self.ready = False
+        self.last_rx = time.monotonic()
+
+    @property
+    def started(self):
+        return self.fd is not None
+
+    def start(self):
+        self.fd = open_serial(self.cfg["serial_port"], self.cfg["baud"])
+        self.last_rx = time.monotonic()
+        self.nudge()
+
+    def nudge(self):
+        self.send(["hello"])
+
+    def poll(self):
+        if self.eof:
+            return 1
+        if self.ready and time.monotonic() - self.last_rx > self.DEAD_S:
+            return 1
+        return None
+
+    def send(self, lines):
+        if not lines or self.fd is None:
+            return
+        data = ("\n".join(lines) + "\n").encode()
+        deadline = time.monotonic() + 2.0
+        while data:
+            try:
+                data = data[os.write(self.fd, data):]
+            except BlockingIOError:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return          # a full output buffer: drop rather than freeze the sender
+                select.select([], [self.fd], [], left)
+            except OSError:
+                self.eof = True
+                return
+
+    def read_lines(self):
+        try:
+            chunk = os.read(self.fd, 4096)
+        except BlockingIOError:
+            return []
+        except OSError:
+            self.eof = True
+            return []
+        if not chunk:
+            self.eof = True
+            return []
+        self.last_rx = time.monotonic()
+        self._buf += chunk
+        *lines, self._buf = self._buf.split(b"\n")
+        lines = [x.decode(errors="replace").strip() for x in lines if x.strip()]
+        # heartbeat answers, and READY answers to a late `hello`, are not news
+        return [x for x in lines if x != "ok" and not (self.ready and x.startswith("READY"))]
+
+    def wait_ready(self, timeout, log=log):
+        super().wait_ready(timeout, log)
+        self.ready = True
+        self.last_rx = time.monotonic()
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                termios.tcdrain(self.fd)    # let the release lines leave the adapter
+            except (termios.error, OSError):
+                pass
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+
+def make_link(cfg):
+    return SerialLink(cfg) if cfg["link"] == "serial" else Link(cfg)
 
 
 # -------------------------------------------------------------- sender
@@ -470,7 +602,7 @@ class Sender:
         self.open_devices()
         log("connecting to the PC...")
         t0 = time.monotonic()
-        self.link = Link(self.cfg)
+        self.link = make_link(self.cfg)
         self.link.start()
         self.link.wait_ready(self.cfg["ready_timeout"])  # nothing is grabbed before this
         if not self.soft:
@@ -506,7 +638,7 @@ class Sender:
                 sys.exit(1)
 
     def shutdown(self):
-        if self.link is not None and self.link.proc is not None:
+        if self.link is not None and self.link.started:
             # the PC would otherwise keep anything still pressed
             self.link.send(release_lines(self.forwarded, self.buttons, now_us()))
         self.stop_libinput()
@@ -525,7 +657,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
     try:
         cfg = load_config(args.config)
-    except (ValueError, KeyError) as err:
+    except (ValueError, KeyError, configparser.Error) as err:
         sys.exit(f"tpkbd: bad config {args.config}: {err}")
     # exit through `finally` on systemctl stop; 0 tells tpkbd-screen to restore the panel
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
