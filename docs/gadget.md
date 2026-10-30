@@ -109,9 +109,46 @@ This is the check that proves the whole point of v2. Report what you see: which 
 
 Differences from v1: no pinch gestures, no horizontal scroll, and the pointer speed is `scale` in `~/.config/tpkbd/recv.conf` on the Pi (see `pi/recv.conf.example`).
 
-## 7. Boot the ThinkPad straight into keyboard mode (GRUB)
+## 7. The wire (UART): no Wi-Fi in the typing path
 
-Do this only after step 4 of section 6 works by hand. Keyboard mode closes the desktop and turns the panel off; soft mode (`tpkbd-soft`) keeps the desktop and toggles with a hotkey. To start in keyboard mode at boot, add a GRUB entry that boots your normal entry with `systemd.unit=tpkbd-mode.target`. The commands are in [v1/docs/setup.md](../v1/docs/setup.md#18-optional-grub-entry); change `'Arch Linux'` in the first command to the title of your own entry (`grep ^menuentry /boot/grub/grub.cfg`). Your normal entry stays in the menu, so nothing is lost if keyboard mode fails. No user session logs in, so Wi-Fi has to be available system-wide ([v1/docs/setup.md](../v1/docs/setup.md) section 10).
+The ThinkPad's USB-to-TTL adapter (3.3 V, e.g. CP2102) talks to the Pi's GPIO UART. `tpkbd-recv` then runs on the Pi as a service that is always listening, and the sender says `hello` until it answers. Wi-Fi/SSH stays only as your way to manage the Pi.
+
+**Wiring** (everything unplugged). Hold the Pi with the SD card slot on the left and the header along the top: the top row of the header is pins 2, 4, 6, 8, 10, ... counted from the left. Pins 2 and 4 are 5 V: leave them empty. Pins 6, 8 and 10 are the three wires:
+
+| Adapter pin | Pi pin |
+|---|---|
+| GND | 6 (GND) |
+| TXD | 10 (GPIO15, the Pi's RXD) |
+| RXD | 8 (GPIO14, the Pi's TXD) |
+
+Never connect the adapter's 5 V or 3V3 pins.
+
+**Pi setup**, over SSH:
+
+1. `sudo nano /boot/firmware/config.txt` and add `enable_uart=1` under `[all]`.
+2. `sudo nano /boot/firmware/cmdline.txt` and delete `console=serial0,115200` (or `console=ttyAMA0,115200`) so the login console stops using the port. It stays one line.
+3. `sudo systemctl disable --now serial-getty@ttyS0.service` (and the same for `serial-getty@ttyAMA0.service` if it exists).
+4. Copy the current `pi/` folder over and run `sudo ./tpkbd-pi/install.sh` again (section 2). It installs `tpkbd-recv.service` and a `tpkbd` user for it.
+5. `sudo reboot`, then `ls -l /dev/serial0` (a link to `ttyS0` or `ttyAMA0`) and `systemctl status tpkbd-recv`. **Expected:** `active (running)` and `listening on /dev/serial0 at 115200 baud` in `journalctl -u tpkbd-recv`.
+
+**ThinkPad setup:**
+
+1. From `v1/`: `sudo thinkpad/install.sh --serial`. It skips the SSH key and address, adds the `tpkbd` user to the serial group (`uucp` or `dialout`) and sets `link = serial` under the existing `[sender]` line of `/etc/tpkbd/tpkbd.conf`.
+2. The port defaults to `/dev/ttyUSB0`. To change it, add `serial_port = ...` under the same `[sender]` line (never a second `[sender]` header). `ls /dev/serial/by-id/` gives a name that doesn't change if the adapter lands on another port.
+3. With the Pi plugged into the target, run `sudo tpkbd-send`. **Expected:** `CONNECTED after 0.x s`, and the ThinkPad's keyboard and TrackPoint drive the target. Left Ctrl + Right Ctrl + Esc stops it. To go back to SSH, remove `link = serial`.
+
+**If it doesn't connect**
+
+- `PC not reachable or receiver not ready`: the Pi isn't answering. Check `systemctl status tpkbd-recv` on the Pi, that `/dev/serial0` is the port in the unit, and that the console on the serial port is really off (steps 2 and 3).
+- `cannot open /dev/ttyUSB0`: wrong name (`dmesg | tail` after plugging in), or you aren't in the serial group (log in again).
+- Garbage or nothing: swap wires 2 and 3. The baud rate is 115200 on both sides; set `baud` in `tpkbd.conf` and `--baud` in the unit together if you change it.
+- If the Pi is switched off or the wire pulled, the sender notices within 5 s and `tpkbd-forward` retries; the receiver releases every key after 3 s of silence.
+
+The wire is not authenticated: anything that can write to the Pi's serial port can type on the target. Keep it a short, private cable.
+
+## 8. Boot the ThinkPad straight into keyboard mode (GRUB)
+
+Do this only after `sudo tpkbd-send` works by hand (section 6 or 7). Keyboard mode closes the desktop and turns the panel off; soft mode (`tpkbd-soft`) keeps the desktop and toggles with a hotkey. To start in keyboard mode at boot, add a GRUB entry that boots your normal entry with `systemd.unit=tpkbd-mode.target`. The commands are in [v1/docs/setup.md](../v1/docs/setup.md#18-optional-grub-entry); change `'Arch Linux'` in the first command to the title of your own entry (`grep ^menuentry /boot/grub/grub.cfg`). Your normal entry stays in the menu, so nothing is lost if keyboard mode fails. No user session logs in, so with the SSH link Wi-Fi has to be available system-wide ([v1/docs/setup.md](../v1/docs/setup.md) section 10). The wire needs no network.
 
 Keep a way back: the entry runs without a desktop. The sender grabs the ThinkPad's keyboard as soon as the Pi's receiver answers, even if the Pi isn't plugged into a target, so the keys then go nowhere. Left Ctrl + Right Ctrl + Esc stops it. If the Pi is off or unreachable the sender never grabs the keyboard, and the panel stays on.
 
@@ -121,4 +158,4 @@ Keep a way back: the entry runs without a desktop. The sender grabs the ThinkPad
 - Media and Fn keys (volume, brightness) aren't mapped: they need a different report.
 - The mouse has a vertical wheel but no horizontal one.
 - There is no pinch-to-zoom.
-- The link from the ThinkPad is SSH over Wi-Fi for now. The wired UART link needs a 3.3 V USB-to-TTL adapter and isn't built yet.
+- The sender talks to the Pi over the UART wire (section 7) or SSH over Wi-Fi (section 6). Neither is tested on a real target in BIOS or GRUB yet.
