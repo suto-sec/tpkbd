@@ -394,6 +394,8 @@ Sender, in `/etc/tpkbd/tpkbd.conf` (section `[sender]`, example in `thinkpad/tpk
 |---|---|---|
 | `libinput_opts` | adaptive, speed 0, tap on, dwt off | same options as `libinput debug-events --help` |
 | `keyboard`, `pointing` | T480 names | comma-separated substrings, see [section 5](#5-sender-find-the-input-devices) |
+| `link` | `ssh` | `ssh` for a PC running `tpkbd-recv` (v1); `serial` for the UART wire to the Pi ([v2](../../v2/docs/wired.md)) |
+| `serial_port`, `baud` | `/dev/ttyUSB0`, `115200` | only with `link = serial` |
 | `ready_timeout` | `15` | seconds to wait for the receiver |
 | `heartbeat_s` | `1` | how often the receiver is told the link is alive |
 | `block_keys` | `KEY_SLEEP KEY_SUSPEND KEY_WAKEUP KEY_POWER` | never forwarded. Names from `/usr/include/linux/input-event-codes.h` |

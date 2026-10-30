@@ -1,6 +1,6 @@
 # tpkbd v1
 
-The software-only version: the PC runs a receiver and needs a booted OS. Paths below are relative to this folder, so run the installers from here (`cd v1`).
+The software-only version: the PC runs a receiver and needs a booted OS. Paths below are relative to this folder, so run the installers from here (`cd v1`). The ThinkPad side (`thinkpad/`) is shared with [v2](../v2/): there the same sender can talk to a Raspberry Pi over a serial wire instead of SSH (`link = serial`); everything on this page is the SSH link.
 
 Use a ThinkPad T480 as a wireless keyboard, TrackPoint and touchpad for another Linux PC.
 

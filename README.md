@@ -1,18 +1,49 @@
 # tpkbd
 
-Use a ThinkPad T480 as a keyboard, TrackPoint and touchpad for another computer.
+Use a ThinkPad T480 as the keyboard, TrackPoint and touchpad for **another computer**.
 
-**v2 (repo root)** is in progress. A Raspberry Pi Zero 2 W plugged into the target computer acts as a real USB keyboard and mouse, and the ThinkPad feeds it over a wired link. Because the target sees ordinary USB hardware, it works in the BIOS/UEFI, in bootloaders such as GRUB, in OS installers and on any operating system, with nothing installed on the target. So far there is the USB gadget, a self-test and a receiver that the v1 sender drives over the UART wire or, for setup, SSH (see [docs/gadget.md](docs/gadget.md)). Pinch, horizontal scroll and the BIOS/GRUB check are still open.
+The ThinkPad grabs its own input and sends it away; the other computer sees it as an ordinary keyboard and mouse. There are two generations, and two ways of connecting the newer one.
 
-**[v1](v1/)** runs over SSH and replays the input on the target through uinput. It needs a booted Linux with the receiver installed, but it works today and has tests and a setup guide. It is kept as is; see [Why v2](#why-v2).
+## Which one do I want?
 
----
+| | **[v1](v1/)** | **[v2](v2/)** |
+|---|---|---|
+| How | The target runs a receiver; input arrives over SSH and is replayed through uinput | A Raspberry Pi plugged into the target *is* a USB keyboard and mouse |
+| Target needs | A booted Linux, `tpkbd-recv`, an SSH server | **Nothing** |
+| Link | SSH over the LAN | **Wired (UART)** or SSH over Wi-Fi, to the Pi |
+| Works in BIOS, GRUB, installers, passphrase prompts | No | Yes, in principle (the real-BIOS check is still open) |
+| Extra hardware | None | Raspberry Pi Zero 2 W, a 3.3 V USB-to-TTL adapter, 3 jumper wires |
+| Pinch to zoom | Real pinch gesture | Ctrl + scroll |
+| State | Finished, kept as is | Wired link works; see the [status](v2/README.md#status) |
 
-## Why v2
+Pick **v1** for a Linux PC you can already boot and don't want extra hardware for. Pick **v2** when the target has no OS yet, isn't yours to install software on, or isn't Linux.
 
-v1 only works once the PC has booted into an OS that runs the receiver. BIOS setup, bootloader menus, disk-encryption passphrase prompts and installers still need a real keyboard, and every PC needs the receiver, an SSH server and uinput permissions.
+## v2 links at a glance
 
-v2 moves that work onto a small USB device, so the target needs no software at all. The trade-offs: an extra device to power and set up, a keyboard limited to the boot-protocol 6-key rollover while in firmware, and pinch-to-zoom needing a different approach (v1 fakes a touchpad on the PC, which a plain USB HID gadget can't do portably).
+- **Wired (UART)**: the real setup. ThinkPad -> USB-to-TTL adapter -> 3 wires -> Pi GPIO. No network in the typing path. [v2/docs/wired.md](v2/docs/wired.md)
+- **Wireless (SSH over Wi-Fi)**: temporary scaffolding, and how you manage the Pi. [v2/docs/wifi.md](v2/docs/wifi.md)
+
+## Repository map
+
+```
+README.md           this page
+v1/                 software-only version
+  pc/                 the receiver for the target PC (v1 only)
+  thinkpad/           the sender, SHARED: v1 and v2 both use it
+  docs/, tests/
+v2/                 the Raspberry Pi version
+  pi/                 everything that runs on the Pi
+  docs/               pi-setup, wired, wifi, boot-mode, features
+  tests/
+.github/workflows/  CI: one job per generation
+```
+
+The sender lives in `v1/thinkpad/` because v1 came first. Its `link` setting (`ssh` or `serial`) is what selects v1-style SSH or the v2 wire.
+
+## Start
+
+- v1: [v1/README.md](v1/README.md) and [v1/docs/setup.md](v1/docs/setup.md).
+- v2: [v2/README.md](v2/README.md), then [v2/docs/pi-setup.md](v2/docs/pi-setup.md).
 
 ## License
 

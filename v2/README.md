@@ -1,0 +1,69 @@
+# tpkbd v2: a Raspberry Pi as the USB keyboard and mouse
+
+A Raspberry Pi Zero 2 W plugged into the target computer acts as a real USB keyboard, mouse and media-key device. The ThinkPad feeds it over a wire. The target sees ordinary USB hardware, so it works in the BIOS/UEFI, in bootloaders such as GRUB, in OS installers and on any operating system, with **nothing installed on the target**.
+
+```
+ ThinkPad T480                          Raspberry Pi Zero 2 W              target PC
+ ------------                           ---------------------              ---------
+ keyboard, TrackPoint, touchpad
+   |  grabbed by tpkbd-send
+   v
+ [ wired: CP2102 adapter --3 wires--> GPIO UART ]--> tpkbd-recv --> USB gadget --USB--> sees a keyboard,
+ [ or Wi-Fi: SSH ---------------------> sshd     ]    (v2/pi)       (tpkbd-hid)          a mouse, media keys
+```
+
+## Two links to the Pi
+
+| | **Wired (UART)** | **Wireless (SSH over Wi-Fi)** |
+|---|---|---|
+| Role | **The real setup** | Temporary scaffolding, and how you manage the Pi |
+| Needs | 3.3 V USB-to-TTL adapter + 3 jumper wires | Nothing extra, but a network and the Pi's IP |
+| Typing path | No network | Wi-Fi: jitter, address changes |
+| Pi side | `tpkbd-recv.service` always running | `sshd` starts `tpkbd-recv` per login |
+| Sender setting | `link = serial` | `link = ssh` (the default) |
+| Guide | [docs/wired.md](docs/wired.md) | [docs/wifi.md](docs/wifi.md) |
+
+The ThinkPad sender (`v1/thinkpad/`) is **shared by v1 and v2**. It lives under `v1/` because v1 came first; it is the same program with a `link` setting.
+
+## Start here
+
+1. [docs/pi-setup.md](docs/pi-setup.md): USB gadget on the Pi, install, self-test. Do this first.
+2. [docs/wired.md](docs/wired.md) (recommended) or [docs/wifi.md](docs/wifi.md): connect the ThinkPad.
+3. [docs/boot-mode.md](docs/boot-mode.md): keyboard mode, soft mode, a GRUB entry that boots into it.
+4. [docs/features.md](docs/features.md): what is forwarded, settings, limits.
+
+## What is in this folder
+
+| Path | What |
+|---|---|
+| `pi/tpkbd-hid` | Creates the USB gadget (configfs), the HID report builders, the self-test |
+| `pi/tpkbd-recv` | Turns the line protocol into USB reports; stdin (SSH) or serial (UART) |
+| `pi/install.sh`, `pi/uninstall.sh` | Install or remove everything on the Pi |
+| `pi/*.service`, `pi/*.rules`, `pi/*.conf` | systemd units, udev rule, module list |
+| `pi/recv.conf.example`, `pi/authorized_keys.example` | Receiver settings, the SSH forced-command line |
+| `docs/` | The guides above |
+| `tests/` | Unit tests, no hardware needed |
+
+Run the tests from this folder: `python3 -m unittest discover -s tests -t .` (the wire tests need `python-evdev`, like v1's).
+
+## Status
+
+| Part | State |
+|---|---|
+| USB gadget, keyboard and mouse, self-test | Verified on real hardware, with the earlier two-function gadget |
+| Wired link (UART) typing from the ThinkPad | Verified on real hardware, with the earlier gadget |
+| The current gadget (three functions, 5-byte mouse report) | **Re-run `tpkbd-hid test` and `sudo tpkbd-send` after updating** |
+| Wi-Fi link | Written and unit-tested; the wire was used in practice |
+| Media keys, horizontal scroll, pinch as Ctrl+wheel | Written and unit-tested; **not yet tried on hardware** |
+| Booting the ThinkPad into keyboard mode from GRUB | Documented, not yet tried |
+| Typing in a real BIOS or GRUB menu on the target | **Not tested yet**: the point of v2, and the next check |
+| Pointer speed (`scale`) tuned for a real USB mouse | Default 1.0, not tuned |
+
+## Limits
+
+- Boot-protocol keyboard: 6 keys at once plus modifiers.
+- A plain USB mouse can't do real pinch gestures: pinch becomes Ctrl + wheel.
+- The Pi must stay powered (PWR IN) and takes 20-30 s to boot. A microcontroller board such as a Raspberry Pi Pico boots instantly and would catch early key presses; a possible later port.
+- The wire is unauthenticated. Keep it short and private.
+
+See [../v1/](../v1/) for the software-only version.
