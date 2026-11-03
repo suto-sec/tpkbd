@@ -72,11 +72,9 @@ Run the tests from this folder: `python3 -m unittest discover -s tests -t .` (th
 - The Pi must stay powered (PWR IN) and takes 20-30 s to boot. A microcontroller board such as a Raspberry Pi Pico boots instantly and would catch early key presses; a possible later port.
 - The wire is unauthenticated. Keep it short and private.
 
-## Planned, not built
+## Possibilities (not planned, not being worked on)
 
-- **Clipboard sharing in soft mode.** A plain USB keyboard has no way back from the target, so the two directions differ:
-  - ThinkPad to target: possible by typing the clipboard text as key presses (a hotkey in soft mode). It would be slow, limited to what the target's keyboard layout can type, and no good for images.
-  - Target to ThinkPad: not possible with a plain keyboard and mouse. It would need a second USB function on the Pi (a serial or storage device) and a small program on the target, which is what v2 avoids.
-- **Pi powered only while the keyboard command runs.** Needs a switch for the Pi's power that the sender controls (a hub with per-port power switching, a switch driven by the adapter's DTR pin, or a smart plug). Pair it with a read-only root filesystem on the Pi.
+- **Clipboard sharing in soft mode, and a "keyboard input here" notification on the target.** A plain USB keyboard has no way back from the target, so both need a second USB function on the Pi (a serial device, added last and dropped first if the controller refuses it) and a small program in the target's desktop session. That gives up "nothing installed on the target" and adds an interface the BIOS has to accept. If ever built: chunked and size-capped messages (the wire is about 11 KB/s), never delaying key and mouse reports, no echo loops between the two clipboards, and a launch option that only gates the data flow. ThinkPad to target alone could be done without any of this by typing the clipboard as key presses, but slowly and only for text the target's layout can type.
+- **Pi powered only while the keyboard command runs.** Needs a switch for the Pi's power that the sender controls (a hub with per-port power switching, a switch driven by the adapter's DTR pin, or a smart plug). Today the Pi takes its power from the target's USB port, and a read-only root filesystem ([docs/hardening.md](docs/hardening.md)) covers the power cuts.
 
 See [../v1/](../v1/) for the software-only version.
