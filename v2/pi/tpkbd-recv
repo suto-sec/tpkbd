@@ -20,7 +20,6 @@ import importlib.machinery
 import importlib.util
 import math
 import os
-import re
 import select
 import sys
 import termios
@@ -37,7 +36,7 @@ DEFAULTS = {
 }
 
 LED_MODES = ("off", "on", "activity")
-LED_DEFAULT = "activity"
+LED_DEFAULT = "on"
 LED_DIRS = ("/sys/class/leds/ACT", "/sys/class/leds/led0")  # new and old kernel names
 LED_FLASH_S = 0.08          # how long the LED stays lit after input in "activity" mode
 
@@ -92,12 +91,10 @@ class Led:
         self.dir = next((d for d in dirs if os.path.isdir(d)), None)
         self.lit = None             # unknown until the first write
         self.until = 0.0            # "activity": switch off at this monotonic time
-        self.saved = None           # the trigger the kernel had set, put back on close
         if self.dir is None:
             say("no ACT LED found: the led setting is ignored")
             return
         try:
-            self.saved = self._selected_trigger()
             self._write("trigger", "none")
             self._set(mode == "on")
         except OSError as err:
@@ -107,11 +104,6 @@ class Led:
     def _write(self, name, value):
         with open(os.path.join(self.dir, name), "w") as f:
             f.write(value)
-
-    def _selected_trigger(self):
-        with open(os.path.join(self.dir, "trigger")) as f:
-            m = re.search(r"\[([^\]]+)\]", f.read())
-        return m.group(1) if m else None
 
     def _set(self, on):
         if on != self.lit:
@@ -142,9 +134,10 @@ class Led:
         return default
 
     def close(self):
-        if self.dir is not None and self.saved:
+        """Leave the LED as the setting made it ("activity" goes dark)."""
+        if self.dir is not None and self.mode == "activity":
             try:
-                self._write("trigger", self.saved)
+                self._set(False)
             except OSError:
                 pass
 

@@ -24,7 +24,7 @@ On the Pi, `/etc/tpkbd/recv.conf` (the UART service) or `~/.config/tpkbd/recv.co
 |---|---|---|
 | `scale` | `1.0` | Pointer speed multiplier |
 | `pinch_clicks` | `6` | Ctrl+wheel clicks per doubling of the pinch distance |
-| `led` | `activity` | The Pi's green LED: `off`, `on`, or `activity` (lit while input is being forwarded). See "Lights" below |
+| `led` | `on` | The Pi's green LED: `on`, `off`, or `activity` (lit while input is being forwarded). See "Lights" below |
 | `watchdog_s` | `3` | Silence this long: release every key and button |
 | `dead_s` | `30` | SSH link only: silence this long, the sender is gone, exit |
 
@@ -34,8 +34,10 @@ On the ThinkPad, `/etc/tpkbd/tpkbd.conf` (`link`, `serial_port`, `baud`, the dev
 
 | Light | Can software change it? |
 |---|---|
-| Pi green LED | Yes: `led = off`, `on` or `activity` in `recv.conf`, then `sudo systemctl restart tpkbd-recv`. It still blinks while the Pi boots, before the service starts. The LED goes back to its normal SD-card blinking when the service stops. |
+| Pi green LED | Yes: `led = on` (default), `off` or `activity` in `recv.conf`, then `sudo systemctl restart tpkbd-recv` (the SSH link reads it at the next connection). Both links use it. The LED is left as the setting made it when the receiver stops. |
 | CP2102 power LED and TX/RX LED | No: they are wired on the adapter's board. Cover them with tape or nail polish, or desolder them. |
+
+To have the LED steady from the first second of boot too (otherwise it blinks with SD-card activity until the service starts), add `dtparam=act_led_trigger=default-on` (or `none` for off) to `/boot/firmware/config.txt` and reboot. The installer does not touch that file.
 
 The Zero 2 W has only the one green LED and no separate power LED. If `journalctl -u tpkbd-recv` says it cannot control the LED, run `pi/install.sh` again and reboot (it installs the rule that lets the service write to the LED).
 

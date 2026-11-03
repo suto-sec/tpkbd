@@ -339,7 +339,7 @@ class Config(unittest.TestCase):
     def test_defaults_without_a_file(self):
         cfg = recv.load_config("/nonexistent/recv.conf")
         self.assertEqual(cfg, {"scale": 1.0, "pinch_clicks": 6.0, "watchdog_s": 3.0, "dead_s": 30.0,
-                               "led": "activity"})
+                               "led": "on"})
 
     def test_override(self):
         with tempfile.TemporaryDirectory() as d:
@@ -443,10 +443,19 @@ class LedSetting(unittest.TestCase):
         self.led("off")
         self.assertEqual(self.d.get("brightness"), "0")
 
-    def test_close_gives_the_led_back(self):
-        led = self.led("off")
+    def test_close_leaves_the_led_as_set(self):
+        led = self.led("on")
         led.close()
-        self.assertEqual(self.d.get("trigger"), "mmc0")
+        self.assertEqual((self.d.get("trigger"), self.d.get("brightness")), ("none", "1"))
+
+    def test_close_darkens_activity_mode(self):
+        led = self.led("activity")
+        led.flash(1.0)
+        led.close()
+        self.assertEqual(self.d.get("brightness"), "0")
+
+    def test_on_is_the_default(self):
+        self.assertEqual(recv.load_config("/nonexistent/recv.conf")["led"], "on")
 
     def test_activity_lights_on_input_then_goes_dark(self):
         led = self.led("activity")
@@ -484,7 +493,9 @@ class LedSetting(unittest.TestCase):
         self.assertEqual(led.timeout(1.0, 0.5), 0.5)
 
     def test_no_permission_is_not_an_error(self):
-        os.remove(os.path.join(self.d.path, "trigger"))     # reading it fails
+        trigger = os.path.join(self.d.path, "trigger")
+        os.remove(trigger)
+        os.mkdir(trigger)       # opening it for writing fails, like a root-only file would
         led = self.led("on")
         led.flash(1.0)
         self.assertIsNone(led.dir)
