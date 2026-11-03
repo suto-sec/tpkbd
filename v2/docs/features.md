@@ -1,6 +1,6 @@
 # What is forwarded, and what isn't
 
-The keyboard, pointer and vertical scroll rows were verified with the earlier gadget. **Media keys, horizontal scroll and pinch are written and unit-tested but not yet tried on hardware**, and the brightness keys may come from an input device the sender doesn't grab (check `grep Name= /proc/bus/input/devices` and the `keyboard` setting).
+The keyboard, pointer and vertical scroll rows were verified with the earlier gadget. Media keys were verified on hardware. **Horizontal scroll and the touchpad pinch are written and unit-tested but not yet tried on hardware**, and the brightness keys may come from an input device the sender doesn't grab (check `grep Name= /proc/bus/input/devices` and the `keyboard` setting).
 
 | ThinkPad input | On the target | Notes |
 |---|---|---|
@@ -8,7 +8,7 @@ The keyboard, pointer and vertical scroll rows were verified with the earlier ga
 | Volume, mute, play/pause, next/previous, stop, brightness, calculator, mail, home page | USB consumer-control device (`/dev/hidg2`) | One media key at a time. Needs a gadget recreated by the current installer (reboot after updating). Not seen by a BIOS. |
 | TrackPoint, touchpad motion and buttons | USB mouse | Processed by libinput on the ThinkPad (acceleration, tap, palm detection). Pointer speed: `scale` in `recv.conf`. |
 | Scroll, vertical and horizontal | Mouse wheel and AC Pan | Horizontal scroll needs a host that understands AC Pan; boot-protocol hosts ignore it. |
-| Pinch to zoom | Ctrl + mouse wheel | A plain USB device can't do a touchpad gesture, so spreading fingers sends Ctrl + wheel up (zoom in), pinching sends Ctrl + wheel down. `pinch_clicks` in `recv.conf` is the number of wheel clicks per doubling (default 6). |
+| Pinch to zoom | A virtual USB touchpad with two fingers (`/dev/hidg3`) | The target gets a real two-finger pinch, so it zooms around the pointer like a laptop. For Linux targets (it needs the kernel's `hid-multitouch`; not Windows). If the Pi has no touchpad function, or `pinch = ctrlwheel`, a pinch becomes Ctrl + mouse wheel instead, which zooms around the window (`pinch_clicks` per doubling). |
 | Fn+4 (sleep), power | **Not forwarded** | Blocked on purpose (`block_keys`), so it can't suspend the target. |
 | Other Fn combinations that have no standard USB code | Not forwarded | |
 
@@ -23,7 +23,9 @@ On the Pi, `/etc/tpkbd/recv.conf` (the UART service) or `~/.config/tpkbd/recv.co
 | Key | Default | Meaning |
 |---|---|---|
 | `scale` | `1.0` | Pointer speed multiplier |
-| `pinch_clicks` | `6` | Ctrl+wheel clicks per doubling of the pinch distance |
+| `pinch` | `touchpad` | `touchpad` (two fingers on a virtual touchpad, zooms around the pointer) or `ctrlwheel` (Ctrl + wheel) |
+| `half0` | `400` | `touchpad`: half the starting distance between the two fingers, 40 units per mm (400 = 20 mm apart) |
+| `pinch_clicks` | `6` | `ctrlwheel`: wheel clicks per doubling of the pinch distance |
 | `led` | `on` | The Pi's green LED: `on`, `off`, or `activity` (lit while input is being forwarded). See "Lights" below |
 | `watchdog_s` | `3` | Silence this long: release every key and button |
 | `dead_s` | `30` | SSH link only: silence this long, the sender is gone, exit |

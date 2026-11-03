@@ -52,9 +52,10 @@ Run the tests from this folder: `python3 -m unittest discover -s tests -t .` (th
 |---|---|
 | USB gadget, keyboard and mouse, self-test | Verified on real hardware, with the earlier two-function gadget |
 | Wired link (UART) typing from the ThinkPad | Verified on real hardware, with the earlier gadget |
-| The current gadget (three functions, 5-byte mouse report) | **Re-run `tpkbd-hid test` and `sudo tpkbd-send` after updating** |
+| The current gadget (four functions, 5-byte mouse report) | **Re-run `tpkbd-hid test` and `sudo tpkbd-send` after updating; check `ls /dev/hidg*` shows four devices** |
 | Wi-Fi link | Written and unit-tested; the wire was used in practice |
-| Media keys, horizontal scroll, pinch as Ctrl+wheel | Written and unit-tested; **not yet tried on hardware** |
+| Media keys | Verified on real hardware |
+| Horizontal scroll, pinch as a virtual touchpad (zoom around the pointer) | Written and unit-tested; **not yet tried on hardware** |
 | Booting the ThinkPad into keyboard mode from GRUB | Documented, not yet tried |
 | Typing in a real BIOS on the target over the wire | Verified on real hardware, with the earlier gadget (GRUB not tried) |
 | Pointer speed (`scale`) tuned for a real USB mouse | Default 1.0, not tuned |
@@ -62,7 +63,7 @@ Run the tests from this folder: `python3 -m unittest discover -s tests -t .` (th
 ## Limits
 
 - Boot-protocol keyboard: 6 keys at once plus modifiers.
-- A plain USB mouse can't do real pinch gestures: pinch becomes Ctrl + wheel.
+- A pinch is two virtual fingers on a USB touchpad, so it is a real gesture on Linux targets. On other targets, or if the Pi can't bind the touchpad function, it falls back to Ctrl + wheel.
 - The Pi must stay powered (PWR IN) and takes 20-30 s to boot. A microcontroller board such as a Raspberry Pi Pico boots instantly and would catch early key presses; a possible later port.
 - The wire is unauthenticated. Keep it short and private.
 

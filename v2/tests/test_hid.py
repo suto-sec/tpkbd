@@ -27,6 +27,140 @@ def input_bytes(desc):
     return bits // 8
 
 
+def walk(desc):
+    """Every Input item of a short-item HID report descriptor, with the global state it saw."""
+    glob, local, depth, items = {}, {}, 0, []
+    i = 0
+    while i < len(desc):
+        prefix = desc[i]
+        n = (0, 1, 2, 4)[prefix & 3]
+        raw = desc[i + 1:i + 1 + n]
+        kind, tag = (prefix >> 2) & 3, prefix >> 4
+        value = int.from_bytes(raw, "little", signed=True) if n else 0
+        if kind == 1:
+            name = {0: "page", 1: "lmin", 2: "lmax", 3: "pmin", 4: "pmax", 5: "exp", 6: "unit",
+                    7: "size", 9: "count"}.get(tag)
+            if name == "exp":
+                value = (value & 0xF) - 16 if value & 0x8 else value & 0xF
+            if name:
+                glob[name] = value
+        elif kind == 2 and tag == 0:
+            local.setdefault("usages", []).append(value)
+        elif kind == 0:
+            if tag == 8:
+                items.append({**glob, **local})
+            elif tag == 0xA:
+                depth += 1
+            elif tag == 0xC:
+                depth -= 1
+                assert depth >= 0, "unbalanced End Collection"
+            local = {}
+        i += 1 + n
+    assert depth == 0, "a collection is never closed"
+    return items
+
+
+class TouchDescriptor(unittest.TestCase):
+    def test_report_length(self):
+        self.assertEqual(input_bytes(hid.TOUCH_DESC), hid.TOUCH_REPORT_LEN)
+
+    def test_layout_is_two_fingers_a_count_and_a_button(self):
+        items = walk(hid.TOUCH_DESC)
+        shape = [(it.get("usages", []), it["size"], it["count"]) for it in items]
+        finger = [([0x42], 1, 1), ([], 3, 1), ([0x51], 4, 1), ([0x30], 16, 1), ([0x31], 16, 1)]
+        self.assertEqual(shape, finger + finger + [([0x54], 8, 1), ([1], 1, 1), ([], 7, 1)])
+
+    def test_the_pad_is_100_by_65_mm_at_40_units_per_mm(self):
+        x, y = walk(hid.TOUCH_DESC)[3:5]
+        for axis, logical, physical in ((x, hid.TOUCH_W, 100), (y, hid.TOUCH_H, 65)):
+            self.assertEqual((axis["lmin"], axis["lmax"]), (0, logical))
+            self.assertEqual((axis["pmin"], axis["pmax"]), (0, physical))
+            self.assertEqual((axis["unit"], axis["exp"]), (0x11, -1))      # centimetres * 10^-1
+            self.assertEqual(logical / physical, 40)
+
+    def test_units_do_not_leak_into_the_contact_count(self):
+        count = walk(hid.TOUCH_DESC)[10]
+        self.assertEqual((count["pmin"], count["pmax"], count["unit"], count["exp"]), (0, 0, 0, 0))
+        self.assertEqual(count["lmax"], 2)
+
+    def test_it_is_a_touch_pad_application(self):
+        self.assertEqual(hid.TOUCH_DESC[:6], bytes([0x05, 0x0D, 0x09, 0x05, 0xA1, 0x01]))
+        self.assertEqual(hid.TOUCH_DESC[-1], 0xC0)
+
+
+class TouchpadReports(unittest.TestCase):
+    def test_fingers_down_side_by_side(self):
+        pad = hid.Touchpad()
+        r = pad.begin(400)
+        self.assertEqual(len(r), hid.TOUCH_REPORT_LEN)
+        self.assertEqual(r[0], 0x01)                                        # tip down, contact 0
+        self.assertEqual(int.from_bytes(r[1:3], "little"), 2000 - 400)
+        self.assertEqual(int.from_bytes(r[3:5], "little"), 1300)
+        self.assertEqual(r[5], 0x11)                                        # tip down, contact 1
+        self.assertEqual(int.from_bytes(r[6:8], "little"), 2000 + 400)
+        self.assertEqual(int.from_bytes(r[8:10], "little"), 1300)
+        self.assertEqual(r[10:], bytes([2, 0]))                             # two contacts, no button
+
+    def test_move_changes_only_the_distance(self):
+        pad = hid.Touchpad()
+        pad.begin(400)
+        r = pad.move(800)
+        self.assertEqual(int.from_bytes(r[1:3], "little"), 1200)
+        self.assertEqual(int.from_bytes(r[6:8], "little"), 2800)
+
+    def test_the_fingers_stay_on_the_pad(self):
+        pad = hid.Touchpad()
+        r = pad.move(10 ** 6)
+        self.assertEqual(int.from_bytes(r[6:8], "little"), 2000 + hid.TOUCH_MAX_HALF)
+        r = pad.move(0)
+        self.assertEqual(int.from_bytes(r[6:8], "little"), 2000 + hid.TOUCH_MIN_HALF)
+
+    def test_end_lifts_both_fingers_where_they_were(self):
+        pad = hid.Touchpad()
+        pad.begin(400)
+        pad.move(600)
+        r = pad.end()
+        self.assertEqual((r[0], r[5]), (0x00, 0x10))                        # tips up, same contacts
+        self.assertEqual(int.from_bytes(r[1:3], "little"), 1400)
+        self.assertEqual(r[10:], bytes([2, 0]))
+
+    def test_end_without_fingers_down_sends_nothing(self):
+        pad = hid.Touchpad()
+        self.assertIsNone(pad.end())
+        pad.begin(400)
+        pad.end()
+        self.assertIsNone(pad.end())
+
+
+class PinchTest(unittest.TestCase):
+    def run_it(self, **kw):
+        out = Recorder()
+        hid.run_pinch_test(out, sleep=lambda s: None, log=lambda m: None, **kw)
+        return out
+
+    def test_spreads_then_pinches_then_lifts(self):
+        reports = self.run_it(countdown=0).reports
+        halves = [(int.from_bytes(r[6:8], "little") - 2000) for r in reports]
+        self.assertEqual(halves[0], 400)
+        self.assertEqual(max(halves), 1200)         # 3x
+        self.assertEqual(halves.index(1200) < len(halves) - 3, True)
+        self.assertEqual(reports[-1][0], 0x00)      # lifted at the end
+        self.assertEqual(reports[-2][0], 0x01)
+
+    def test_lifts_even_if_interrupted(self):
+        out = Recorder()
+        calls = []
+
+        def sleep(s):
+            calls.append(s)
+            if len(calls) == 10:
+                raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            hid.run_pinch_test(out, countdown=0, sleep=sleep, log=lambda m: None)
+        self.assertEqual(out.reports[-1][0], 0x00)
+
+
 class Descriptors(unittest.TestCase):
     def test_report_lengths_match_the_descriptors(self):
         self.assertEqual(input_bytes(hid.KBD_DESC), hid.KBD_REPORT_LEN)
@@ -372,9 +506,65 @@ class FakeGadgetTests(unittest.TestCase):
         self.assertEqual(self.read("functions/hid.usb2/report_length"), "2")
         self.assertEqual(self.read("functions/hid.usb2/report_desc", "rb"), hid.CONSUMER_DESC)
 
+    def test_the_touchpad_is_the_fourth_function(self):
+        self.g.up()
+        self.assertEqual(self.read("functions/hid.usb3/protocol"), "0")
+        self.assertEqual(self.read("functions/hid.usb3/subclass"), "0")
+        self.assertEqual(self.read("functions/hid.usb3/report_length"), "12")
+        self.assertEqual(self.read("functions/hid.usb3/report_desc", "rb"), hid.TOUCH_DESC)
+
+    def test_only_the_keyboard_keeps_an_out_endpoint(self):
+        self.g.up()
+        self.assertFalse(os.path.exists(os.path.join(self.g.root, "functions/hid.usb0/no_out_endpoint")))
+        for name in ("hid.usb1", "hid.usb2", "hid.usb3"):
+            self.assertEqual(self.read(f"functions/{name}/no_out_endpoint"), "1")
+
+    def test_a_kernel_without_no_out_endpoint_is_fine(self):
+        real_put = self.g._put
+
+        def put(rel, value):
+            if rel.endswith("no_out_endpoint"):
+                raise FileNotFoundError(rel)
+            return real_put(rel, value)
+
+        self.g._put = put
+        self.g.up()
+        self.assertEqual(self.read("UDC"), "a.usb")
+
+    def test_without_the_touchpad_when_the_controller_refuses(self):
+        real_put = self.g._put
+        tries = []
+
+        def put(rel, value):
+            if rel == "UDC" and value == "a.usb":
+                tries.append(os.path.exists(os.path.join(self.g.root, "functions/hid.usb3")))
+                if len(tries) == 1:
+                    raise OSError(errno.ENOMEM, "out of endpoints")
+            return real_put(rel, value)
+
+        self.g._put = put
+        with mock.patch.object(hid.sys, "stderr"):
+            self.g.up()
+        self.assertEqual(tries, [True, False])
+        self.assertEqual(self.read("UDC"), "a.usb")
+        self.assertFalse(os.path.exists(os.path.join(self.g.root, "functions/hid.usb3")))
+        self.assertTrue(os.path.islink(os.path.join(self.g.root, "configs/c.1/hid.usb2")))
+
+    def test_a_failure_without_the_touchpad_is_reported(self):
+        real_put = self.g._put
+
+        def put(rel, value):
+            if rel == "UDC" and value == "a.usb":
+                raise OSError(errno.EBUSY, "busy")
+            return real_put(rel, value)
+
+        self.g._put = put
+        with mock.patch.object(hid.sys, "stderr"), self.assertRaises(OSError):
+            self.g.up()
+
     def test_functions_are_linked_into_the_config(self):
         self.g.up()
-        for name in ("hid.usb0", "hid.usb1", "hid.usb2"):
+        for name in ("hid.usb0", "hid.usb1", "hid.usb2", "hid.usb3"):
             link = os.path.join(self.g.root, "configs", "c.1", name)
             self.assertTrue(os.path.islink(link))
             self.assertEqual(os.readlink(link), os.path.join(self.g.root, "functions", name))
@@ -395,7 +585,7 @@ class FakeGadgetTests(unittest.TestCase):
         self.assertEqual(self.read("UDC"), "a.usb")
         links = [n for n in os.listdir(os.path.join(self.g.root, "configs", "c.1"))
                  if n.startswith("hid.")]
-        self.assertEqual(sorted(links), ["hid.usb0", "hid.usb1", "hid.usb2"])
+        self.assertEqual(sorted(links), ["hid.usb0", "hid.usb1", "hid.usb2", "hid.usb3"])
 
     def test_down_removes_it(self):
         self.g.up()
@@ -419,7 +609,7 @@ class FakeGadgetTests(unittest.TestCase):
         with mock.patch.object(hid.os, "unlink", side_effect=unlink):
             self.g.down()
         self.assertEqual(order[0], ("UDC", "\n"))
-        self.assertEqual([o[0] for o in order].count("unlink"), 3)
+        self.assertEqual([o[0] for o in order].count("unlink"), 4)
 
     def test_status(self):
         self.assertEqual(self.g.status(), "down")

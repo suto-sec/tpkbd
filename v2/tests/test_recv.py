@@ -339,7 +339,7 @@ class Config(unittest.TestCase):
     def test_defaults_without_a_file(self):
         cfg = recv.load_config("/nonexistent/recv.conf")
         self.assertEqual(cfg, {"scale": 1.0, "pinch_clicks": 6.0, "watchdog_s": 3.0, "dead_s": 30.0,
-                               "led": "on"})
+                               "half0": 400.0, "pinch": "touchpad", "led": "on"})
 
     def test_override(self):
         with tempfile.TemporaryDirectory() as d:
@@ -391,6 +391,100 @@ class Serve(unittest.TestCase):
                 os.close(w)
         # released once by the watchdog, once on the way out
         self.assertEqual(kbd.reports.count(bytes(8)), 2)
+
+
+class TouchpadPinch(unittest.TestCase):
+    def make(self, **cfg):
+        kbd, mouse, touch = FakeOut(), FakeOut(), FakeOut()
+        rp = recv.Replayer(kbd, mouse, {**CFG, **cfg}, touch_out=touch)
+        return rp, kbd, mouse, touch
+
+    @staticmethod
+    def half(report):
+        return int.from_bytes(report[6:8], "little") - 2000
+
+    def test_begin_puts_two_fingers_down(self):
+        rp, kbd, mouse, touch = self.make()
+        rp.handle("g b 1 1")
+        self.assertEqual(touch.reports, [recv.hid.Touchpad().begin(400)])
+        self.assertEqual(touch.timeouts, [recv.BUTTON_WAIT_S])
+
+    def test_updates_move_the_fingers_apart_and_together(self):
+        rp, _, _, touch = self.make()
+        rp.handle("g b 1 1")
+        rp.handle("g u 2.0 1")
+        rp.handle("g u 0.5 1")
+        self.assertEqual([self.half(r) for r in touch.reports], [400, 800, 200])
+        self.assertEqual(touch.timeouts[1:], [recv.MOTION_WAIT_S] * 2)
+
+    def test_the_end_lifts_them(self):
+        rp, _, _, touch = self.make()
+        rp.handle("g b 1 1")
+        rp.handle("g u 1.5 1")
+        rp.handle("g e 1 1")
+        self.assertEqual((touch.reports[-1][0], touch.reports[-1][5]), (0x00, 0x10))
+        self.assertEqual(touch.timeouts[-1], recv.BUTTON_WAIT_S)
+        self.assertFalse(rp.touch.down)
+
+    def test_no_ctrl_and_no_wheel(self):
+        rp, kbd, mouse, _ = self.make()
+        rp.handle("g b 1 1")
+        rp.handle("g u 3.0 1")
+        rp.handle("g e 1 1")
+        self.assertEqual((kbd.reports, mouse.reports), ([], []))
+
+    def test_a_long_pinch_starts_over_in_the_middle(self):
+        rp, _, _, touch = self.make()
+        rp.handle("g b 1 1")
+        rp.handle("g u 4.0 1")          # 1600: still on the pad
+        n = len(touch.reports)
+        rp.handle("g u 5.0 1")          # 2000: off the pad
+        lift, down = touch.reports[n], touch.reports[n + 1]
+        self.assertEqual(lift[0], 0x00)
+        self.assertEqual(self.half(down), 400)
+        rp.handle("g u 6.0 1")          # measured from where it started over
+        self.assertEqual(self.half(touch.reports[-1]), round(400 * 6.0 / 5.0))
+
+    def test_an_update_without_a_begin_starts_there(self):
+        rp, _, _, touch = self.make()
+        rp.handle("g u 1.7 1")
+        rp.handle("g u 3.4 1")
+        self.assertEqual([self.half(r) for r in touch.reports], [400, 800])
+
+    def test_pinch_ctrlwheel_setting_uses_ctrl_and_wheel(self):
+        rp, kbd, mouse, touch = self.make(pinch="ctrlwheel", pinch_clicks=6.0)
+        rp.handle("g b 1 1")
+        rp.handle("g u 2.0 1")
+        rp.handle("g e 1 1")
+        self.assertEqual(touch.reports, [])
+        self.assertEqual(len(kbd.reports), 2)
+        self.assertTrue(mouse.reports)
+
+    def test_losing_the_sender_lifts_the_fingers(self):
+        rp, _, _, touch = self.make()
+        rp.handle("g b 1 1")
+        rp.release_all()
+        self.assertEqual(touch.reports[-1][0], 0x00)
+        n = len(touch.reports)
+        rp.release_all()                # nothing down: nothing more to lift
+        self.assertEqual(len(touch.reports), n)
+
+    def test_half0_setting(self):
+        rp, _, _, touch = self.make(half0=600.0)
+        rp.handle("g b 1 1")
+        self.assertEqual(self.half(touch.reports[0]), 600)
+
+    def test_config_default_and_unknown_mode(self):
+        self.assertEqual(recv.load_config("/nonexistent/recv.conf")["pinch"], "touchpad")
+        with tempfile.TemporaryDirectory() as t:
+            path = os.path.join(t, "recv.conf")
+            with open(path, "w") as f:
+                f.write("[receiver]\npinch = CtrlWheel\n")
+            self.assertEqual(recv.load_config(path)["pinch"], "ctrlwheel")
+            with open(path, "w") as f:
+                f.write("[receiver]\npinch = gesture\n")
+            with self.assertRaises(ValueError):
+                recv.load_config(path)
 
 
 class FakeLedDir:

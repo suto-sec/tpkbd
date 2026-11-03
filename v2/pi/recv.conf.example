@@ -4,7 +4,14 @@
 # target's pointer feels slow, lower it if it feels fast
 # scale = 1.0
 
-# Ctrl+wheel clicks per doubling of the pinch distance (a pinch becomes Ctrl + wheel)
+# How a pinch reaches the target: touchpad (two fingers on a virtual touchpad: the target zooms
+# around the pointer like a laptop; Linux targets) or ctrlwheel (Ctrl + mouse wheel: zooms
+# around the window, works anywhere). touchpad falls back to ctrlwheel if the Pi has no touchpad
+# function
+# pinch = touchpad
+# touchpad: half the starting distance between the fingers, 40 units per mm (400 = 20 mm apart)
+# half0 = 400
+# ctrlwheel: wheel clicks per doubling of the pinch distance
 # pinch_clicks = 6
 
 # the Pi's green LED: on, off, or activity (lit only while input is being forwarded).

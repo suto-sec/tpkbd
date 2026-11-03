@@ -13,7 +13,7 @@ The ThinkPad grabs its own input and sends it away; the other computer sees it a
 | Link | SSH over the LAN | **Wired (UART)** or SSH over Wi-Fi, to the Pi |
 | Works in BIOS, GRUB, installers, passphrase prompts | No | Yes, in principle (the real-BIOS check is still open) |
 | Extra hardware | None | Raspberry Pi Zero 2 W, a 3.3 V USB-to-TTL adapter, 3 jumper wires |
-| Pinch to zoom | Real pinch gesture | Ctrl + scroll |
+| Pinch to zoom | Real pinch gesture | Real pinch gesture on Linux targets (virtual touchpad), Ctrl + scroll elsewhere |
 | State | Finished, kept as is | Wired link works; see the [status](v2/README.md#status) |
 
 Pick **v1** for a Linux PC you can already boot and don't want extra hardware for. Pick **v2** when the target has no OS yet, isn't yours to install software on, or isn't Linux.

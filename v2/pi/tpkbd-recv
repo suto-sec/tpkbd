@@ -31,9 +31,13 @@ CONF_PATH = os.path.expanduser("~/.config/tpkbd/recv.conf")
 DEFAULTS = {
     "scale": "1.0",         # pointer speed on the target, 1.0 = as sent
     "pinch_clicks": "6",    # Ctrl+wheel clicks per doubling of the pinch distance
+    "half0": "400",         # touchpad pinch: half the starting finger distance (40 units/mm)
     "watchdog_s": "3",      # silence this long: release every key and button
     "dead_s": "30",         # silence this long: the sender is gone, exit
 }
+
+PINCH_MODES = ("touchpad", "ctrlwheel")
+PINCH_DEFAULT = "touchpad"
 
 LED_MODES = ("off", "on", "activity")
 LED_DEFAULT = "on"
@@ -74,6 +78,9 @@ def load_config(path=CONF_PATH):
     cp.read(path)  # a missing file just means defaults
     s = cp["receiver"]
     cfg = {k: float(s[k]) for k in DEFAULTS}
+    cfg["pinch"] = s.get("pinch", PINCH_DEFAULT).strip().lower()
+    if cfg["pinch"] not in PINCH_MODES:
+        raise ValueError(f"pinch must be one of {', '.join(PINCH_MODES)}, not {cfg['pinch']!r}")
     cfg["led"] = s.get("led", LED_DEFAULT).strip().lower()
     if cfg["led"] not in LED_MODES:
         raise ValueError(f"led must be one of {', '.join(LED_MODES)}, not {cfg['led']!r}")
@@ -145,9 +152,13 @@ class Led:
 class Replayer:
     """Protocol lines in, HID reports out. A host that isn't reading is not an error."""
 
-    def __init__(self, kbd_out, mouse_out, cfg, reply=None, consumer_out=None, led=None):
+    def __init__(self, kbd_out, mouse_out, cfg, reply=None, consumer_out=None, led=None,
+                 touch_out=None):
         self.kbd_out, self.mouse_out = kbd_out, mouse_out
         self.consumer_out = consumer_out    # media keys; None if the gadget predates them
+        self.touch_out = touch_out  # pinch as two fingers on a touchpad; None: Ctrl + wheel
+        if cfg.get("pinch", PINCH_DEFAULT) == "ctrlwheel":
+            self.touch_out = None
         self.led = led              # Led or None
         self.reply = reply          # writes a line back to the sender (serial mode only)
         self.scale = cfg["scale"]
@@ -157,6 +168,9 @@ class Replayer:
         self.consumer = hid.Consumer()
         self.pending = []           # key events up to the next SYN
         self.rem_x = self.rem_y = self.rem_v = self.rem_h = 0.0
+        self.half0 = cfg.get("half0", 400.0)
+        self.touch = hid.Touchpad()
+        self.pinch_base = 1.0       # touchpad pinch: the scale at which the fingers were put down
         self.pinching = False
         self.pinch_sent = 0         # wheel clicks already sent for the current pinch
         self.write_errors = 0
@@ -169,6 +183,10 @@ class Replayer:
                 (self.mouse_out, self.mouse.release_all())]
         if self.consumer_out is not None:
             outs.append((self.consumer_out, self.consumer.release_all()))
+        if self.touch_out is not None:
+            lift = self.touch.end()
+            if lift:
+                outs.append((self.touch_out, lift))
         for out, report in outs:
             try:
                 out.send(report, BUTTON_WAIT_S)
@@ -239,19 +257,30 @@ class Replayer:
                 self.mouse_out.send(report, MOTION_WAIT_S)
 
         elif tag == "g":
-            # A plain USB mouse can't pinch, so a pinch becomes Ctrl + wheel, which
-            # zooms in browsers, editors and most viewers.
             if p[1] == "b":
-                self.pinching, self.pinch_sent = True, 0
+                self.pinch_begin()
             elif p[1] == "u":
                 self.pinch_update(float(p[2]))
             elif p[1] == "e":
                 self.pinch_end()
 
+    # Pinch. With a touchpad function the target sees two fingers moving apart or together,
+    # which it turns into its own pinch gesture: zoom around the pointer, like a laptop.
+    # Without one, a pinch becomes Ctrl + wheel, which zooms around the window instead.
+
+    def pinch_begin(self):
+        self.pinching, self.pinch_sent = True, 0
+        if self.touch_out is not None:
+            self.pinch_base = 1.0
+            self.touch_out.send(self.touch.begin(self.half0), BUTTON_WAIT_S)
+
     def pinch_update(self, scale):
         if scale <= 0:
             raise ValueError(f"pinch scale {scale}")
         self.pinching = True
+        if self.touch_out is not None:
+            self.touch_update(scale)
+            return
         target = round(math.log2(scale) * self.pinch_clicks)
         delta = target - self.pinch_sent
         if not delta:
@@ -263,8 +292,26 @@ class Replayer:
         for report in self.mouse.moves(0, 0, delta):    # spreading fingers (scale > 1) is up: zoom in
             self.mouse_out.send(report, MOTION_WAIT_S)
 
+    def touch_update(self, scale):
+        if not self.touch.down:     # the begin was lost: start from here
+            self.pinch_base = scale
+            self.touch_out.send(self.touch.begin(self.half0), BUTTON_WAIT_S)
+            return
+        half = self.half0 * scale / self.pinch_base
+        if not hid.TOUCH_MIN_HALF < half < hid.TOUCH_MAX_HALF:
+            # the fake fingers ran out of pad: lift them and put them down in the middle
+            # again, so a long pinch keeps zooming instead of stalling
+            self.touch_out.send(self.touch.end(), BUTTON_WAIT_S)
+            self.pinch_base = scale
+            self.touch_out.send(self.touch.begin(self.half0), BUTTON_WAIT_S)
+            return
+        self.touch_out.send(self.touch.move(half), MOTION_WAIT_S)
+
     def pinch_end(self):
         self.pinching = False
+        lift = self.touch.end()
+        if lift and self.touch_out is not None:
+            self.touch_out.send(lift, BUTTON_WAIT_S)
         if self.kb.virtual_mods & CTRL:
             self.kb.virtual_mods &= ~CTRL
             self.kbd_out.send(self.kb.report(), KEY_WAIT_S)
@@ -366,16 +413,25 @@ def main():
     except hid.HidError:
         consumer_out = None
         say("no /dev/hidg2: media keys are off until the gadget is recreated (re-run pi/install.sh, reboot)")
+    try:
+        touch_out = hid.HidOut.open("/dev/hidg3")
+    except hid.HidError:
+        touch_out = None
+        if cfg["pinch"] == "touchpad":
+            say("no /dev/hidg3: pinch uses Ctrl + wheel until the gadget is recreated "
+                "(re-run pi/install.sh, reboot)")
     led = Led(cfg["led"])
     try:
         if args.serial:
             fd = open_serial(args.serial, args.baud)
             say(f"listening on {args.serial} at {args.baud} baud")
             serve(Replayer(kbd_out, mouse_out, cfg, reply=serial_reply(fd),
-                           consumer_out=consumer_out, led=led), fd, cfg["watchdog_s"], 0)
+                           consumer_out=consumer_out, led=led, touch_out=touch_out),
+                  fd, cfg["watchdog_s"], 0)
             return
         print(f"READY {PROTO}", flush=True)
-        serve(Replayer(kbd_out, mouse_out, cfg, consumer_out=consumer_out, led=led),
+        serve(Replayer(kbd_out, mouse_out, cfg, consumer_out=consumer_out, led=led,
+                       touch_out=touch_out),
               0, cfg["watchdog_s"], cfg["dead_s"])
     finally:
         led.close()

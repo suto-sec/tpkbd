@@ -53,6 +53,38 @@ CONSUMER_DESC = bytes([
 ])
 CONSUMER_REPORT_LEN = 2
 
+# Touchpad, only ever used to make a pinch: two fingers on a 100 x 65 mm pad (40 units per mm).
+# One report holds both fingers: for each, Tip Switch (1 bit), 3 padding bits, Contact ID
+# (4 bits), X and Y (16 bits each); then the contact count and one button. No report IDs and
+# no feature reports, so it is for Linux hosts (hid-multitouch) and not for Windows.
+def _finger_desc():
+    return bytes([
+        0x05, 0x0D, 0x09, 0x22, 0xA1, 0x02,         # Digitizer, Finger, Collection (Logical)
+        0x15, 0x00, 0x25, 0x01, 0x09, 0x42,         # Tip Switch, 0..1
+        0x75, 0x01, 0x95, 0x01, 0x81, 0x02,         # 1 bit
+        0x75, 0x03, 0x95, 0x01, 0x81, 0x03,         # 3 bits of padding
+        0x25, 0x0F, 0x75, 0x04, 0x09, 0x51,         # Contact Identifier, 0..15, 4 bits
+        0x81, 0x02,
+        0x05, 0x01, 0x26, 0xA0, 0x0F, 0x75, 0x10,   # Generic Desktop, 0..4000, 16 bits
+        0x55, 0x0F, 0x65, 0x11,                     # exponent -1, centimetres: so the unit is mm
+        0x35, 0x00, 0x45, 0x64, 0x09, 0x30, 0x81, 0x02,     # X, 0..100 mm
+        0x26, 0x28, 0x0A, 0x45, 0x41, 0x09, 0x31, 0x81, 0x02,   # Y: 0..2600, 0..65 mm
+        0xC0,
+    ])
+
+
+TOUCH_DESC = (bytes([0x05, 0x0D, 0x09, 0x05, 0xA1, 0x01]) + _finger_desc() + _finger_desc() + bytes([
+    0x35, 0x00, 0x45, 0x00, 0x55, 0x00, 0x65, 0x00,         # forget the physical units
+    0x05, 0x0D, 0x09, 0x54, 0x15, 0x00, 0x25, 0x02, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,    # contact count
+    0x05, 0x09, 0x09, 0x01, 0x25, 0x01, 0x75, 0x01, 0x95, 0x01, 0x81, 0x02,    # button 1
+    0x75, 0x07, 0x95, 0x01, 0x81, 0x03,
+    0xC0,
+]))
+TOUCH_REPORT_LEN = 12
+TOUCH_W, TOUCH_H = 4000, 2600
+TOUCH_CX, TOUCH_CY = TOUCH_W // 2, TOUCH_H // 2
+TOUCH_MIN_HALF, TOUCH_MAX_HALF = 20, TOUCH_CX - 50      # half the distance between the fingers
+
 # Linux evdev key codes (input-event-codes.h) -> HID keyboard usages (usage page 0x07)
 
 # modifier keys are bits of report byte 0 instead of key slots
@@ -233,6 +265,42 @@ class Mouse:
         return self._pack()
 
 
+class Touchpad:
+    """Two fake fingers, side by side in the middle of the pad, moving apart or together."""
+
+    def __init__(self):
+        self.down = False
+        self.half = 0
+
+    @staticmethod
+    def _pack(half, tip):
+        out = b""
+        for finger, x in enumerate((TOUCH_CX - half, TOUCH_CX + half)):
+            out += struct.pack("<BHH", (tip & 1) | (finger << 4), x, TOUCH_CY)
+        return out + bytes([2, 0])      # two contacts in this report, button up
+
+    @staticmethod
+    def clamp(half):
+        return max(TOUCH_MIN_HALF, min(int(half), TOUCH_MAX_HALF))
+
+    def begin(self, half):
+        self.down, self.half = True, self.clamp(half)
+        return self._pack(self.half, 1)
+
+    def move(self, half):
+        self.half = self.clamp(half)
+        return self._pack(self.half, 1)
+
+    def end(self):
+        """The lift report, or None if no finger is down."""
+        if not self.down:
+            return None
+        self.down = False
+        return self._pack(self.half, 0)
+
+    release_all = end
+
+
 class HidOut:
     """A /dev/hidgN device. Writes never block for long: the host may be off or asleep."""
 
@@ -308,7 +376,9 @@ class Gadget:
                               "is dtoverlay=dwc2 set in config.txt, and did the Pi reboot?")
         return names[0]
 
-    def up(self):
+    def up(self, touchpad=True):
+        """Create and bind the gadget. If the controller can't take the touchpad function
+        (it has few endpoints), do it again without: typing matters more than pinching."""
         if not os.path.isdir(self.base):
             raise GadgetError(f"{self.base} missing: load libcomposite "
                               "(sudo modprobe libcomposite) and mount configfs")
@@ -328,18 +398,34 @@ class Gadget:
         self._put(f"configs/c.1/strings/{LANG}/configuration", "HID")
         self._put("configs/c.1/MaxPower", 100)
         self._put("configs/c.1/bmAttributes", "0xA0")   # bus powered, remote wakeup
-        for name, protocol, subclass, length, desc in (
-                ("hid.usb0", 1, 1, KBD_REPORT_LEN, KBD_DESC),
-                ("hid.usb1", 2, 1, MOUSE_REPORT_LEN, MOUSE_DESC),
-                ("hid.usb2", 0, 0, CONSUMER_REPORT_LEN, CONSUMER_DESC)):     # not a boot interface
+        functions = [("hid.usb0", 1, 1, KBD_REPORT_LEN, KBD_DESC),
+                     ("hid.usb1", 2, 1, MOUSE_REPORT_LEN, MOUSE_DESC),
+                     ("hid.usb2", 0, 0, CONSUMER_REPORT_LEN, CONSUMER_DESC)]     # not a boot interface
+        if touchpad:
+            functions.append(("hid.usb3", 0, 0, TOUCH_REPORT_LEN, TOUCH_DESC))
+        for name, protocol, subclass, length, desc in functions:
             self._mkdir(f"functions/{name}")
             self._put(f"functions/{name}/protocol", protocol)
             self._put(f"functions/{name}/subclass", subclass)
             self._put(f"functions/{name}/report_length", length)
             self._put(f"functions/{name}/report_desc", desc)
+            if name != "hid.usb0":
+                # only the keyboard receives reports (its LEDs); an OUT endpoint on the
+                # others would use up the controller's few endpoints. Old kernels lack it.
+                try:
+                    self._put(f"functions/{name}/no_out_endpoint", 1)
+                except FileNotFoundError:
+                    pass
             os.symlink(os.path.join(self.root, "functions", name),
                        os.path.join(self.root, "configs", "c.1", name))
-        self._put("UDC", udc)
+        try:
+            self._put("UDC", udc)
+        except OSError as err:
+            if not touchpad:
+                raise
+            print(f"tpkbd-hid: cannot bind the gadget with the touchpad function ({err}): "
+                  "trying without it, pinch will use Ctrl + wheel", file=sys.stderr)
+            self.up(touchpad=False)
 
     def down(self):
         if not os.path.exists(self.root):
@@ -354,7 +440,8 @@ class Gadget:
                 if os.path.islink(os.path.join(cfg, name)):
                     os.unlink(os.path.join(cfg, name))
         for rel in (f"configs/c.1/strings/{LANG}", "configs/c.1", "functions/hid.usb0",
-                    "functions/hid.usb1", "functions/hid.usb2", f"strings/{LANG}", ""):
+                    "functions/hid.usb1", "functions/hid.usb2", "functions/hid.usb3",
+                    f"strings/{LANG}", ""):
             self._rmdir(rel)
 
     def status(self):
@@ -431,6 +518,31 @@ def run_test(kbd_out, mouse_out, text="Tpkbd test", countdown=3, sleep=time.slee
     log("done")
 
 
+def run_pinch_test(out, countdown=3, sleep=time.sleep, log=print):
+    """Spread two fingers, hold, then pinch them back and lift."""
+    pad = Touchpad()
+    try:
+        for n in range(countdown, 0, -1):
+            log(f"pinching in {n}: put the pointer over a web page or an image")
+            sleep(1)
+        start = 400
+        log("spreading (zoom in)")
+        out.send(pad.begin(start))
+        for i in range(1, 41):
+            out.send(pad.move(start * (1 + i * 0.05)))      # up to 3x
+            sleep(0.02)
+        sleep(0.5)
+        log("pinching (zoom out)")
+        for i in range(40, -1, -1):
+            out.send(pad.move(start * (1 + i * 0.05)))
+            sleep(0.02)
+    finally:
+        report = pad.end()
+        if report:
+            out.send(report)
+    log("done")
+
+
 def main():
     ap = argparse.ArgumentParser(description="USB keyboard and mouse gadget for the Pi.")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -443,9 +555,14 @@ def main():
     t.add_argument("--mouse", default="/dev/hidg1")
     t.add_argument("--text", default="Tpkbd test")
     t.add_argument("--countdown", type=int, default=3)
+    pt = sub.add_parser("test-pinch", help="spread and pinch two fingers on the connected computer")
+    pt.add_argument("--touchpad", default="/dev/hidg3")
+    pt.add_argument("--countdown", type=int, default=3)
     args = ap.parse_args()
     try:
-        if args.cmd == "gadget":
+        if args.cmd == "test-pinch":
+            run_pinch_test(HidOut.open(args.touchpad), args.countdown)
+        elif args.cmd == "gadget":
             gadget = Gadget(args.configfs, args.udc_dir)
             if args.action == "status":
                 print(gadget.status())
