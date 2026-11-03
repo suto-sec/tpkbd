@@ -24,7 +24,7 @@ Do these in order, and stop at any point:
 Safety nets:
 
 - `config.txt` is copied once to `config.txt.tpkbd-orig` before the first edit. Our lines carry a `# tpkbd harden.sh` comment above them, which is how `--undo` finds them; a line you added yourself is never removed.
-- `--ssh` refuses unless your `~/.ssh/authorized_keys` has a key. Copy one first: `ssh-copy-id <user>@<pi-ip>` from the ThinkPad.
+- `--ssh` refuses unless your `~/.ssh/authorized_keys` has an ordinary key line (a forced-command line, like `authorized_keys.example`, does not count). Copy one first: `ssh-copy-id <user>@<pi-ip>` from the ThinkPad.
 - The new SSH settings are checked with `sshd -t` and `sshd -T`. If sshd rejects them, or another setting still allows passwords, the script puts the old state back.
 - After `--ssh`, keep your current session open and try a new `ssh` login with your key before closing it.
 

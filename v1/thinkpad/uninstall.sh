@@ -18,6 +18,8 @@ fi
 rm -f /etc/systemd/system/tpkbd-forward.service \
       /etc/systemd/system/tpkbd-soft.service \
       /etc/systemd/system/tpkbd-mode.target
+systemctl --global disable tpkbd-notify.service 2>/dev/null || true
+rm -f /etc/systemd/user/tpkbd-notify.service /usr/local/bin/tpkbd-notify
 systemctl daemon-reload
 rm -f /usr/local/bin/tpkbd-send /usr/local/bin/tpkbd-screen /usr/local/bin/tpkbd-pair
 

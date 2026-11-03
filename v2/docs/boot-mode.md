@@ -11,6 +11,8 @@ The ThinkPad side works the same for v1 and v2 and for both links ([wired](wired
 
 Both use whichever link `/etc/tpkbd/tpkbd.conf` selects (`link = serial` for the wire, `ssh` or nothing for SSH). The `isolate` command saves nothing: save your work first, the desktop closes.
 
+**Notification on the laptop.** When the hotkey hands the keyboard back to the laptop, a notification "Keyboard input here" shows for 3 seconds. It comes from `tpkbd-notify`, a user service in your desktop session (installed and enabled for all users by `thinkpad/install.sh`; log in again, or run `systemctl --user enable --now tpkbd-notify` once). Check it with `tpkbd-notify --test`, which shows the notification without soft mode. There is **no matching notification on the target yet**: a plain USB keyboard has no way to tell the target anything, so that needs the data channel planned for the clipboard feature.
+
 **Soft mode keeps the laptop awake while input is on the PC.** Otherwise the laptop would see no input, suspend after its idle time, and need the power button. While input goes to the PC, `tpkbd-send` holds a systemd sleep and idle inhibitor (`systemd-inhibit`), and lets go when you switch back or stop the service. Check with `systemd-inhibit --list` (a `tpkbd` row). It does not stop the screen from dimming or locking, and closing the lid still follows your normal lid setting. To turn it off, set `inhibit_sleep = no` in `/etc/tpkbd/tpkbd.conf` and restart `tpkbd-soft`. Keyboard mode does not use it.
 
 If the panel stays black after leaving keyboard mode, press the power button: the forced-off state doesn't survive a reboot.

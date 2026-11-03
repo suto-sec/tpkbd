@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Shows a 3 second desktop notification, "Keyboard input here", when soft mode hands the
+keyboard back to this laptop.
+
+Runs as a systemd user service in the desktop session (tpkbd-send runs as a system user and
+has no session bus). It only watches /run/tpkbd/state, which tpkbd-send writes."""
+import argparse
+import subprocess
+import sys
+import time
+
+STATE_PATH = "/run/tpkbd/state"
+POLL_S = 0.3
+NOTIFY = ["notify-send", "--app-name=tpkbd", "--expire-time=3000", "--icon=input-keyboard"]
+TITLE = "Keyboard input here"
+BODY = "This laptop"
+
+
+def read_state(path=STATE_PATH):
+    """"local", "remote", or None while soft mode isn't running."""
+    try:
+        with open(path) as f:
+            state = f.read().strip()
+    except OSError:
+        return None
+    return state if state in ("local", "remote") else None
+
+
+def notify(title=TITLE, body=BODY, cmd=None):
+    try:
+        subprocess.run([*(cmd or NOTIFY), title, body], timeout=5, check=False,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        pass        # no notification daemon: nothing to do about it
+
+
+class Watcher:
+    def __init__(self, path=STATE_PATH, show=notify):
+        self.path, self.show = path, show
+        self.last = None        # the first read only sets the baseline
+
+    def step(self):
+        state = read_state(self.path)
+        if state is None:       # soft mode stopped: keep what we knew
+            return
+        if self.last == "remote" and state == "local":
+            self.show()
+        self.last = state
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Notify when soft mode returns the keyboard here.")
+    ap.add_argument("--state", default=STATE_PATH)
+    ap.add_argument("--test", action="store_true", help="show the notification once and exit")
+    args = ap.parse_args(argv)
+    if args.test:
+        notify()
+        return 0
+    w = Watcher(args.state)
+    while True:
+        w.step()
+        time.sleep(POLL_S)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -99,8 +99,10 @@ harden_ssh() {
         fi
         auth_keys="$(getent passwd "$user" | cut -d: -f6)/.ssh/authorized_keys"
     fi
-    if ! grep -qE '^[[:space:]]*[^#[:space:]]' "$auth_keys" 2>/dev/null; then
-        echo "refusing: $auth_keys has no key, so key-only SSH would lock you out." >&2
+    # a plain key line starts with the key type; a line starting with options (command="..."
+    # forced-command lines, like authorized_keys.example) gives no interactive login
+    if ! grep -qE '^[[:space:]]*(ssh-|ecdsa-|sk-)' "$auth_keys" 2>/dev/null; then
+        echo "refusing: $auth_keys has no ordinary key, so key-only SSH would lock you out." >&2
         echo "from the ThinkPad: ssh-copy-id <user>@<pi-ip>   then run this again." >&2
         exit 1
     fi

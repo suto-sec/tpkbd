@@ -88,6 +88,10 @@ fi
 install -m 644 "$SCRIPT_DIR/tpkbd-mode.target" /etc/systemd/system/tpkbd-mode.target
 install -m 644 "$SCRIPT_DIR/tpkbd-forward.service" /etc/systemd/system/tpkbd-forward.service
 install -m 644 "$SCRIPT_DIR/tpkbd-soft.service" /etc/systemd/system/tpkbd-soft.service
+# the desktop notification for soft mode: a user service, so it can reach the session's bus
+install -m 755 "$SCRIPT_DIR/tpkbd-notify" /usr/local/bin/tpkbd-notify
+install -m 644 "$SCRIPT_DIR/tpkbd-notify.service" /etc/systemd/user/tpkbd-notify.service
+systemctl --global enable tpkbd-notify.service
 systemctl daemon-reload
 systemctl enable tpkbd-forward.service
 

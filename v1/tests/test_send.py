@@ -363,6 +363,8 @@ class SoftToggle(unittest.TestCase):
                 s.set_state("remote")
                 with open(send.STATE_PATH) as f:
                     self.assertEqual(f.read(), "remote\n")
+                # the desktop notifier runs as another user
+                self.assertEqual(os.stat(send.STATE_PATH).st_mode & 0o777, 0o644)
             finally:
                 send.STATE_PATH = old
 

@@ -1,0 +1,12 @@
+[Unit]
+Description=tpkbd: "Keyboard input here" notification when soft mode returns to this laptop
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/local/bin/tpkbd-notify
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

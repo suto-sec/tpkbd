@@ -621,6 +621,7 @@ class Sender:
         try:
             with open(STATE_PATH, "w") as f:
                 f.write(state + "\n")
+            os.chmod(STATE_PATH, 0o644)     # the desktop notifier runs as the logged-in user
         except OSError:
             pass
 

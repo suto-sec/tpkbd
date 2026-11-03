@@ -100,8 +100,18 @@ class Harden(unittest.TestCase):
         self.write(self.keys, "# only a comment\n\n")
         r = self.run_script("--ssh")
         self.assertEqual(r.returncode, 1)
-        self.assertIn("no key", r.stderr)
+        self.assertIn("no ordinary key", r.stderr)
         self.assertFalse(os.path.exists(self.dropin))
+
+    def test_ssh_refused_with_only_a_forced_command_key(self):
+        self.write(self.keys, 'command="/usr/local/bin/tpkbd-recv",no-pty ssh-ed25519 AAAA t@l\n')
+        r = self.run_script("--ssh")
+        self.assertEqual(r.returncode, 1)
+        self.assertFalse(os.path.exists(self.dropin))
+
+    def test_ssh_accepts_an_ecdsa_key(self):
+        self.write(self.keys, "ecdsa-sha2-nistp256 AAAA t@l\n")
+        self.assertEqual(self.run_script("--ssh").returncode, 0)
 
     def test_ssh_refused_when_the_key_file_is_missing(self):
         os.remove(self.keys)
