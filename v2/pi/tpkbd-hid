@@ -11,6 +11,7 @@ and bootloaders accept them, and consumer control (/dev/hidg2) for media keys.
 Standard library only.
 """
 import argparse
+import configparser
 import errno
 import os
 import select
@@ -45,6 +46,68 @@ MOUSE_DESC = bytes([
     0xC0, 0xC0,
 ])
 MOUSE_REPORT_LEN = 5
+
+# The same report with a high-resolution wheel (scroll = smooth). The input layout is byte for
+# byte the same; what changes is that the wheel and AC Pan each sit in a logical collection with
+# a Resolution Multiplier feature. The host sets the multiplier to its maximum, and a wheel count
+# of 1 then means 1/120 of a click instead of a whole click. Hosts that ignore the feature (the
+# BIOS reads the boot report only) never see the difference.
+HIRES_PER_CLICK = 120
+
+
+def _multiplier_desc():
+    return bytes([
+        0x05, 0x01, 0x09, 0x48,                     # Generic Desktop, Resolution Multiplier
+        0x15, 0x00, 0x25, 0x01,                     # logical 0..1
+        0x35, 0x01, 0x45, HIRES_PER_CLICK,          # physical 1..120: the multiplier it selects
+        0x75, 0x02, 0x95, 0x01, 0xB1, 0x02,         # 2 bits, Feature (Data, Variable)
+    ])
+
+
+MOUSE_HIRES_DESC = (bytes([
+    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, 0x05, 0x09,
+    0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01,
+    0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x03, 0x05, 0x01,
+    0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x02, 0x81, 0x06,
+    0xA1, 0x02]) + _multiplier_desc() + bytes([
+    0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x35, 0x00, 0x45, 0x00, 0x75, 0x08, 0x95, 0x01,
+    0x81, 0x06,                                     # Wheel
+    0xC0, 0xA1, 0x02]) + _multiplier_desc() + bytes([
+    0x05, 0x0C, 0x0A, 0x38, 0x02, 0x15, 0x81, 0x25, 0x7F, 0x35, 0x00, 0x45, 0x00, 0x75, 0x08,
+    0x95, 0x01, 0x81, 0x06,                         # Consumer page, AC Pan
+    0xC0,
+    0x75, 0x04, 0x95, 0x01, 0xB1, 0x03,             # pad the two feature fields to a byte
+    0xC0, 0xC0]))
+
+SCROLL_MODES = ("smooth", "click")
+SCROLL_DEFAULT = "smooth"
+SCROLL_FILE = "/run/tpkbd-scroll"   # the mode the gadget was really built with
+
+
+def mouse_desc(scroll):
+    return MOUSE_HIRES_DESC if scroll == "smooth" else MOUSE_DESC
+
+
+def read_scroll_setting(path):
+    """The `scroll` setting of a recv.conf ([receiver] section); a missing file means the default."""
+    cp = configparser.ConfigParser(interpolation=None)
+    try:
+        cp.read(path)
+    except configparser.Error as err:
+        raise GadgetError(f"cannot read {path}: {err}")
+    mode = cp.get("receiver", "scroll", fallback=SCROLL_DEFAULT).strip().lower()
+    if mode not in SCROLL_MODES:
+        raise GadgetError(f"scroll must be one of {', '.join(SCROLL_MODES)}, not {mode!r} (in {path})")
+    return mode
+
+
+def applied_scroll(path=SCROLL_FILE):
+    """The scroll mode the running gadget has: 'click' unless it says it was built 'smooth'."""
+    try:
+        with open(path) as f:
+            return "smooth" if f.read().strip() == "smooth" else "click"
+    except OSError:
+        return "click"
 
 # Consumer control: one 16-bit usage at a time (0 = nothing pressed).
 CONSUMER_DESC = bytes([
@@ -343,7 +406,9 @@ LANG = "0x409"
 
 
 class Gadget:
-    def __init__(self, configfs="/sys/kernel/config", udc_dir="/sys/class/udc", rmtree=False):
+    def __init__(self, configfs="/sys/kernel/config", udc_dir="/sys/class/udc", rmtree=False,
+                 scroll_file=SCROLL_FILE):
+        self.scroll_file = scroll_file
         self.base = os.path.join(configfs, "usb_gadget")
         self.root = os.path.join(self.base, GADGET)
         self.udc_dir = udc_dir
@@ -376,7 +441,7 @@ class Gadget:
                               "is dtoverlay=dwc2 set in config.txt, and did the Pi reboot?")
         return names[0]
 
-    def up(self, touchpad=True):
+    def up(self, touchpad=True, scroll=SCROLL_DEFAULT):
         """Create and bind the gadget. If the controller can't take the touchpad function
         (it has few endpoints), do it again without: typing matters more than pinching."""
         if not os.path.isdir(self.base):
@@ -399,7 +464,7 @@ class Gadget:
         self._put("configs/c.1/MaxPower", 100)
         self._put("configs/c.1/bmAttributes", "0xA0")   # bus powered, remote wakeup
         functions = [("hid.usb0", 1, 1, KBD_REPORT_LEN, KBD_DESC),
-                     ("hid.usb1", 2, 1, MOUSE_REPORT_LEN, MOUSE_DESC),
+                     ("hid.usb1", 2, 1, MOUSE_REPORT_LEN, mouse_desc(scroll)),
                      ("hid.usb2", 0, 0, CONSUMER_REPORT_LEN, CONSUMER_DESC)]     # not a boot interface
         if touchpad:
             functions.append(("hid.usb3", 0, 0, TOUCH_REPORT_LEN, TOUCH_DESC))
@@ -425,9 +490,24 @@ class Gadget:
                 raise
             print(f"tpkbd-hid: cannot bind the gadget with the touchpad function ({err}): "
                   "trying without it, pinch will use Ctrl + wheel", file=sys.stderr)
-            self.up(touchpad=False)
+            self.up(touchpad=False, scroll=scroll)
+            return
+        self._record_scroll(scroll)
+
+    def _record_scroll(self, scroll):
+        """Tell the receiver which mouse descriptor the host got: a 120x mistake otherwise."""
+        try:
+            with open(self.scroll_file, "w") as f:
+                f.write(scroll + "\n")
+        except OSError as err:
+            print(f"tpkbd-hid: cannot write {self.scroll_file} ({err}): "
+                  "the receiver will scroll in whole clicks", file=sys.stderr)
 
     def down(self):
+        try:
+            os.unlink(self.scroll_file)
+        except OSError:
+            pass
         if not os.path.exists(self.root):
             return
         try:
@@ -445,7 +525,7 @@ class Gadget:
             self._rmdir(rel)
 
     def status(self):
-        """One line: 'down', 'idle' (not bound), or the bound controller's state."""
+        """One line: 'down', 'idle' (not bound), or the bound controller's state and scroll mode."""
         if not os.path.exists(self.root):
             return "down"
         try:
@@ -460,7 +540,7 @@ class Gadget:
                 state = f.read().strip()
         except OSError:
             state = "unknown"
-        return f"{udc}: {state}"
+        return f"{udc}: {state}, scroll {applied_scroll(self.scroll_file)}"
 
 
 def udc_state(udc_dir="/sys/class/udc"):
@@ -557,6 +637,34 @@ def run_pinch_test(out, countdown=3, sleep=time.sleep, log=print):
     log("done")
 
 
+def run_scroll_test(out, hires, countdown=3, sleep=time.sleep, log=print):
+    """Scroll down and back up in small steps. `hires`: 1/120 click units, else whole clicks."""
+    mouse = Mouse()
+    step = 15 if hires else 1                   # an eighth of a click, or one click
+    steps = 120 if hires else 15
+    for n in range(countdown, 0, -1):
+        log(f"scrolling in {n}: put the pointer over a long web page")
+        sleep(1)
+    log(f"scrolling down {steps} steps of {'1/8 click' if hires else '1 click'}")
+    for _ in range(steps):
+        for report in mouse.moves(0, 0, -step):
+            out.send(report)
+        sleep(0.02)
+    sleep(0.5)
+    log("scrolling back up")
+    for _ in range(steps):
+        for report in mouse.moves(0, 0, step):
+            out.send(report)
+        sleep(0.02)
+    log("done")
+    if hires:
+        log("smooth means the page moved a little at a time. On the target check with "
+            "`libinput debug-events` (scroll events with fractional v120 values) or `evtest`")
+        log("(REL_WHEEL_HI_RES). If the page jumped by whole screens, or nothing moved, set "
+            "scroll = click in /etc/tpkbd/recv.conf and `sudo systemctl restart tpkbd-gadget`")
+        log("also look at `dmesg` on the target for 'feature report' or timeout errors when the Pi was plugged in")
+
+
 def main():
     ap = argparse.ArgumentParser(description="USB keyboard and mouse gadget for the Pi.")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -564,11 +672,20 @@ def main():
     g.add_argument("action", choices=("up", "down", "status"))
     g.add_argument("--configfs", default="/sys/kernel/config")
     g.add_argument("--udc-dir", default="/sys/class/udc")
+    g.add_argument("--config", default="/etc/tpkbd/recv.conf",
+                   help="where the scroll setting is read from when bringing the gadget up")
+    g.add_argument("--scroll-file", default=SCROLL_FILE)
     t = sub.add_parser("test", help="type and move the pointer on the connected computer")
     t.add_argument("--kbd", default="/dev/hidg0")
     t.add_argument("--mouse", default="/dev/hidg1")
     t.add_argument("--text", default="Tpkbd test")
     t.add_argument("--countdown", type=int, default=3)
+    sc = sub.add_parser("test-scroll", help="scroll a page slowly on the connected computer")
+    sc.add_argument("--mouse", default="/dev/hidg1")
+    sc.add_argument("--mode", choices=("auto",) + SCROLL_MODES, default="auto",
+                    help="auto: whatever the gadget was built with")
+    sc.add_argument("--scroll-file", default=SCROLL_FILE)
+    sc.add_argument("--countdown", type=int, default=3)
     pt = sub.add_parser("test-pinch", help="spread and pinch two fingers on the connected computer")
     pt.add_argument("--touchpad", default="/dev/hidg3")
     pt.add_argument("--countdown", type=int, default=3)
@@ -576,12 +693,17 @@ def main():
     try:
         if args.cmd == "test-pinch":
             run_pinch_test(HidOut.open(args.touchpad), args.countdown)
+        elif args.cmd == "test-scroll":
+            mode = applied_scroll(args.scroll_file) if args.mode == "auto" else args.mode
+            run_scroll_test(HidOut.open(args.mouse), mode == "smooth", args.countdown)
         elif args.cmd == "gadget":
-            gadget = Gadget(args.configfs, args.udc_dir)
+            gadget = Gadget(args.configfs, args.udc_dir, scroll_file=args.scroll_file)
             if args.action == "status":
                 print(gadget.status())
+            elif args.action == "up":
+                gadget.up(scroll=read_scroll_setting(args.config))
             else:
-                getattr(gadget, args.action)()
+                gadget.down()
         else:
             kbd, mouse = HidOut.open(args.kbd), HidOut.open(args.mouse)
             run_test(kbd, mouse, args.text, args.countdown)

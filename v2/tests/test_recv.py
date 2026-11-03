@@ -1,4 +1,5 @@
 import os
+import struct
 import tempfile
 import threading
 import time
@@ -142,6 +143,29 @@ class Pointer(unittest.TestCase):
         rp, _, mouse = make()
         rp.handle("s 15 15 1")
         self.assertEqual(mouse.reports, [bytes([0, 0, 0, 0xFF, 1])])
+
+    def test_smooth_scroll_sends_eighths_of_a_click(self):
+        rp, _, mouse = make(scroll_applied="smooth")
+        rp.handle("s 15 0 1")       # libinput's unit for one click: 120 hi-res counts
+        self.assertEqual(mouse.reports, [bytes([0, 0, 0, 0x88, 0])])    # -120
+
+    def test_smooth_scroll_small_steps_and_horizontal(self):
+        rp, _, mouse = make(scroll_applied="smooth")
+        rp.handle("s -1 2 1")       # 8 up, 16 right
+        self.assertEqual(mouse.reports, [bytes([0, 0, 0, 8, 16])])
+
+    def test_smooth_scroll_splits_big_flicks(self):
+        rp, _, mouse = make(scroll_applied="smooth")
+        rp.handle("s 45 0 1")       # 3 clicks = 360 counts: more than one report holds
+        wheel = [struct.unpack("Bbbbb", r)[3] for r in mouse.reports]
+        self.assertEqual(sum(wheel), -360)
+        self.assertTrue(all(abs(w) <= 127 for w in wheel))
+
+    def test_the_config_alone_does_not_change_the_scale(self):
+        # `scroll = smooth` in the file means nothing until the gadget was rebuilt with it
+        rp, _, mouse = make(scroll="smooth")
+        rp.handle("s 15 0 1")
+        self.assertEqual(mouse.reports, [bytes([0, 0, 0, 0xFF, 0])])
 
     def test_horizontal_fractions_accumulate(self):
         rp, _, mouse = make()
@@ -339,7 +363,7 @@ class Config(unittest.TestCase):
     def test_defaults_without_a_file(self):
         cfg = recv.load_config("/nonexistent/recv.conf")
         self.assertEqual(cfg, {"scale": 1.0, "pinch_clicks": 6.0, "watchdog_s": 3.0, "dead_s": 30.0,
-                               "half0": 400.0, "pinch": "touchpad", "led": "on"})
+                               "half0": 400.0, "pinch": "touchpad", "led": "on", "scroll": "smooth"})
 
     def test_override(self):
         with tempfile.TemporaryDirectory() as d:
@@ -347,6 +371,23 @@ class Config(unittest.TestCase):
             with open(path, "w") as f:
                 f.write("[receiver]\nscale = 1.5\n")
             self.assertEqual(recv.load_config(path)["scale"], 1.5)
+
+
+class ScrollSetting(unittest.TestCase):
+    def test_unknown_mode_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "recv.conf")
+            with open(path, "w") as f:
+                f.write("[receiver]\nscroll = jerky\n")
+            with self.assertRaisesRegex(ValueError, "scroll must be one of"):
+                recv.load_config(path)
+
+    def test_click_is_accepted(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "recv.conf")
+            with open(path, "w") as f:
+                f.write("[receiver]\nscroll = click\n")
+            self.assertEqual(recv.load_config(path)["scroll"], "click")
 
 
 class Serve(unittest.TestCase):

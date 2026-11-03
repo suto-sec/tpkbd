@@ -83,6 +83,9 @@ def load_config(path=CONF_PATH):
     cfg["pinch"] = s.get("pinch", PINCH_DEFAULT).strip().lower()
     if cfg["pinch"] not in PINCH_MODES:
         raise ValueError(f"pinch must be one of {', '.join(PINCH_MODES)}, not {cfg['pinch']!r}")
+    cfg["scroll"] = s.get("scroll", hid.SCROLL_DEFAULT).strip().lower()
+    if cfg["scroll"] not in hid.SCROLL_MODES:
+        raise ValueError(f"scroll must be one of {', '.join(hid.SCROLL_MODES)}, not {cfg['scroll']!r}")
     cfg["led"] = s.get("led", LED_DEFAULT).strip().lower()
     if cfg["led"] not in LED_MODES:
         raise ValueError(f"led must be one of {', '.join(LED_MODES)}, not {cfg['led']!r}")
@@ -168,6 +171,9 @@ class Replayer:
         self.reply = reply          # writes a line back to the sender (serial mode only)
         self.scale = cfg["scale"]
         self.pinch_clicks = cfg.get("pinch_clicks", 6.0)
+        # what the gadget was built with, not what the config says now: a wheel count means
+        # 1/120 click for a smooth mouse descriptor and a whole click for the plain one
+        self.wheel_per_unit = (hid.HIRES_PER_CLICK if cfg.get("scroll_applied") == "smooth" else 1) / WHEEL_UNITS
         self.kb = hid.Keyboard()
         self.mouse = hid.Mouse()
         self.consumer = hid.Consumer()
@@ -276,8 +282,8 @@ class Replayer:
         elif tag == "s":
             # libinput: vertical positive is down but the HID wheel is positive up;
             # horizontal is positive to the right on both
-            self.rem_v += -float(p[1]) / WHEEL_UNITS
-            self.rem_h += float(p[2]) / WHEEL_UNITS
+            self.rem_v += -float(p[1]) * self.wheel_per_unit
+            self.rem_h += float(p[2]) * self.wheel_per_unit
             clicks, pans = int(self.rem_v), int(self.rem_h)
             self.rem_v -= clicks
             self.rem_h -= pans
@@ -445,6 +451,10 @@ def main():
         if cfg["pinch"] == "touchpad":
             say("no /dev/hidg3: pinch uses Ctrl + wheel until the gadget is recreated "
                 "(re-run pi/install.sh, reboot)")
+    cfg["scroll_applied"] = hid.applied_scroll()
+    if cfg["scroll_applied"] != cfg["scroll"]:
+        say(f"scroll = {cfg['scroll']} is set but the gadget was built with {cfg['scroll_applied']}: "
+            "run `sudo systemctl restart tpkbd-gadget` to apply it")
     led = Led(cfg["led"])
     try:
         if args.serial:

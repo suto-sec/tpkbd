@@ -57,6 +57,7 @@ Run the tests from this folder: `python3 -m unittest discover -s tests -t .` (th
 | Media keys | Verified on real hardware |
 | Pinch as a virtual touchpad (zoom around the pointer) | Verified on real hardware |
 | Horizontal scroll | Written and unit-tested; **not yet tried on hardware** |
+| Smooth (high-resolution) scrolling, `scroll = smooth` | Written and unit-tested; **not yet tried on hardware** (`scroll = click` is the verified descriptor) |
 | Booting the ThinkPad into keyboard mode from GRUB | Documented, not yet tried |
 | Typing in a real BIOS on the target over the wire | Verified on real hardware, also with the current four-function gadget (GRUB not tried) |
 | Pointer speed (`scale`) tuned for a real USB mouse | Default 1.0, not tuned |

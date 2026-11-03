@@ -122,6 +122,28 @@ sudo libinput debug-events                                  # while test-pinch r
 | `POINTER_SCROLL_FINGER` (or `GESTURE_SWIPE_*`) instead | The fingers' movement was read as a scroll: tune `half0` (distance between the fingers) in `recv.conf` |
 | No new touchpad device | `hid-multitouch` didn't bind: on the target `dmesg \| grep -i -E "hid|multitouch"`, and check `ls /dev/hidg*` on the Pi shows four devices |
 
+### Smooth scrolling
+
+```bash
+tpkbd-hid gadget status     # ends with "scroll smooth" or "scroll click"
+tpkbd-hid test-scroll
+```
+
+After a 3 second countdown the page scrolls down in small steps, then back up (in `click` mode in whole clicks). **Expected:** with `smooth` the page glides in eighth-of-a-click steps. On the target:
+
+```bash
+sudo libinput debug-events | grep -i scroll   # smooth: fractional values (v120 below 120)
+dmesg | grep -i -E "hid|feature|timeout"      # errors when the Pi was plugged in
+```
+
+| What you see | Meaning |
+|---|---|
+| Small `POINTER_SCROLL_WHEEL` values / `REL_WHEEL_HI_RES` | Working |
+| The page jumps by whole screens, or scrolls 100x too little | The host did not take the multiplier: set `scroll = click` in `/etc/tpkbd/recv.conf`, then `sudo systemctl restart tpkbd-gadget` |
+| Feature report errors in `dmesg`, no mouse at all | Same fix. If the Pi cannot be reached over the wire, use SSH (or edit `/etc/tpkbd/recv.conf` on the SD card) |
+
+Confirm scrolling before turning on the read-only filesystem (the fix is a config edit, which the overlay would discard) and before turning Wi-Fi off.
+
 ## 5. The real target: BIOS and GRUB
 
 This is the check that proves the point of v2, and it has not been done yet.

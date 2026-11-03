@@ -1,5 +1,6 @@
 import errno
 import os
+import struct
 import tempfile
 import unittest
 from unittest import mock
@@ -7,6 +8,15 @@ from unittest import mock
 from tests.loader import load
 
 hid = load("pi/tpkbd-hid")
+
+
+class FakeOut:
+    def __init__(self):
+        self.reports = []
+
+    def send(self, report, timeout=0.5):
+        self.reports.append(report)
+        return True
 
 
 def input_bytes(desc):
@@ -27,8 +37,9 @@ def input_bytes(desc):
     return bits // 8
 
 
-def walk(desc):
-    """Every Input item of a short-item HID report descriptor, with the global state it saw."""
+def walk(desc, main_tag=8):
+    """Every Input item (or main_tag 0xB: Feature) of a short-item HID report descriptor,
+    with the global state it saw."""
     glob, local, depth, items = {}, {}, 0, []
     i = 0
     while i < len(desc):
@@ -47,7 +58,7 @@ def walk(desc):
         elif kind == 2 and tag == 0:
             local.setdefault("usages", []).append(value)
         elif kind == 0:
-            if tag == 8:
+            if tag == main_tag:
                 items.append({**glob, **local})
             elif tag == 0xA:
                 depth += 1
@@ -159,6 +170,91 @@ class PinchTest(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             hid.run_pinch_test(out, countdown=0, sleep=sleep, log=lambda m: None)
         self.assertEqual(out.reports[-1][0], 0x00)
+
+
+# the mouse descriptor that has run on real hardware: scroll = click must stay byte for byte this
+PLAIN_MOUSE_DESC = bytes.fromhex(
+    "05010902a1010901a1000509190129031500250195037501810295017505810305010930"
+    "093109381581257f750895038106050c0a38021581257f750895018106c0c0")
+
+
+class ScrollDescriptor(unittest.TestCase):
+    def test_click_is_the_plain_descriptor(self):
+        self.assertEqual(hid.mouse_desc("click"), hid.MOUSE_DESC)
+        self.assertEqual(hid.MOUSE_DESC, PLAIN_MOUSE_DESC)
+        self.assertEqual(len(hid.MOUSE_DESC), 67)
+
+    def test_smooth_keeps_the_five_byte_input_layout(self):
+        d = hid.mouse_desc("smooth")
+        self.assertIs(d, hid.MOUSE_HIRES_DESC)
+        self.assertEqual(input_bytes(d), hid.MOUSE_REPORT_LEN)
+        shape = [(it.get("usages", []), it["size"], it["count"]) for it in walk(d)]
+        self.assertEqual(shape, [([], 1, 3), ([], 5, 1), ([0x30, 0x31], 8, 2),
+                                 ([0x38], 8, 1), ([0x238], 8, 1)])
+        plain = [(it.get("usages", []), it["size"], it["count"]) for it in walk(hid.MOUSE_DESC)]
+        self.assertEqual(sum(sz * n for _, sz, n in shape), sum(sz * n for _, sz, n in plain))
+
+    def test_boot_fields_come_first_and_unchanged(self):
+        # a boot-protocol host reads buttons, X, Y at bytes 0..2 and ignores the descriptor
+        d = hid.MOUSE_HIRES_DESC
+        self.assertTrue(d.startswith(hid.MOUSE_DESC[:34]))
+
+    def test_the_multiplier_goes_up_to_one_count_per_120th_of_a_click(self):
+        feats = walk(hid.MOUSE_HIRES_DESC, 0xB)
+        mult = [f for f in feats if f.get("usages") == [0x48]]
+        self.assertEqual(len(mult), 2)              # wheel and AC Pan each have their own
+        for f in mult:
+            self.assertEqual((f["size"], f["count"], f["lmin"], f["lmax"], f["pmin"], f["pmax"]),
+                             (2, 1, 0, 1, 1, 120))
+        pad = [f for f in feats if f.get("usages") is None]
+        self.assertEqual([(f["size"], f["count"]) for f in pad], [(4, 1)])
+
+    def test_descriptor_is_balanced(self):
+        walk(hid.MOUSE_HIRES_DESC)
+        self.assertEqual(hid.MOUSE_HIRES_DESC[-2:], bytes([0xC0, 0xC0]))
+        # each multiplier sits directly inside a logical collection (0xA1 0x02) with its wheel
+        d = hid.MOUSE_HIRES_DESC
+        self.assertEqual(d.count(bytes([0xA1, 0x02])), 2)
+        self.assertEqual(d.count(bytes([0xC0])), 4)     # 2 logical + physical + application
+
+    def test_the_setting_is_read_from_the_config(self):
+        with tempfile.TemporaryDirectory() as t:
+            path = os.path.join(t, "recv.conf")
+            self.assertEqual(hid.read_scroll_setting(path), "smooth")        # no file
+            with open(path, "w") as f:
+                f.write("[receiver]\nscroll = Click\n")
+            self.assertEqual(hid.read_scroll_setting(path), "click")
+            with open(path, "w") as f:
+                f.write("[receiver]\nscroll = jerky\n")
+            with self.assertRaisesRegex(hid.GadgetError, "scroll must be one of"):
+                hid.read_scroll_setting(path)
+
+    def test_applied_scroll_defaults_to_click(self):
+        with tempfile.TemporaryDirectory() as t:
+            path = os.path.join(t, "s")
+            self.assertEqual(hid.applied_scroll(path), "click")     # no file: the safe one
+            for text, want in (("smooth\n", "smooth"), ("click\n", "click"), ("junk", "click")):
+                with open(path, "w") as f:
+                    f.write(text)
+                self.assertEqual(hid.applied_scroll(path), want)
+
+
+class ScrollTest(unittest.TestCase):
+    def run_it(self, hires):
+        out = FakeOut()
+        hid.run_scroll_test(out, hires, countdown=0, sleep=lambda s: None, log=lambda m: None)
+        return [struct.unpack("Bbbbb", r)[3] for r in out.reports]
+
+    def test_smooth_steps_are_eighths_of_a_click_and_come_back(self):
+        wheel = self.run_it(True)
+        self.assertEqual(set(wheel), {-15, 15})
+        self.assertEqual(sum(wheel), 0)
+        self.assertEqual(sum(w for w in wheel if w < 0), -1800)    # 15 clicks
+
+    def test_click_steps_are_whole_clicks(self):
+        wheel = self.run_it(False)
+        self.assertEqual(set(wheel), {-1, 1})
+        self.assertEqual(sum(wheel), 0)
 
 
 class Descriptors(unittest.TestCase):
@@ -484,7 +580,8 @@ class FakeGadgetTests(unittest.TestCase):
         os.makedirs(os.path.join(self.udc_dir, "a.usb"))
         with open(os.path.join(self.udc_dir, "a.usb", "state"), "w") as f:
             f.write("configured\n")
-        self.g = hid.Gadget(self.configfs, self.udc_dir, rmtree=True)
+        self.scroll_file = os.path.join(self.tmp.name, "tpkbd-scroll")
+        self.g = hid.Gadget(self.configfs, self.udc_dir, rmtree=True, scroll_file=self.scroll_file)
 
     def read(self, rel, mode="r"):
         with open(os.path.join(self.g.root, rel), mode) as f:
@@ -499,7 +596,7 @@ class FakeGadgetTests(unittest.TestCase):
         self.assertEqual(self.read("functions/hid.usb1/protocol"), "2")
         self.assertEqual(self.read("functions/hid.usb1/subclass"), "1")
         self.assertEqual(self.read("functions/hid.usb1/report_length"), "5")
-        self.assertEqual(self.read("functions/hid.usb1/report_desc", "rb"), hid.MOUSE_DESC)
+        self.assertEqual(self.read("functions/hid.usb1/report_desc", "rb"), hid.MOUSE_HIRES_DESC)
         # media keys: a plain (non-boot) interface
         self.assertEqual(self.read("functions/hid.usb2/protocol"), "0")
         self.assertEqual(self.read("functions/hid.usb2/subclass"), "0")
@@ -614,7 +711,34 @@ class FakeGadgetTests(unittest.TestCase):
     def test_status(self):
         self.assertEqual(self.g.status(), "down")
         self.g.up()
-        self.assertEqual(self.g.status(), "a.usb: configured")
+        self.assertEqual(self.g.status(), "a.usb: configured, scroll smooth")
+
+    def test_scroll_click_builds_the_plain_mouse(self):
+        self.g.up(scroll="click")
+        self.assertEqual(self.read("functions/hid.usb1/report_desc", "rb"), hid.MOUSE_DESC)
+        self.assertEqual(hid.applied_scroll(self.scroll_file), "click")
+        self.assertTrue(self.g.status().endswith("scroll click"))
+
+    def test_the_applied_mode_is_recorded_and_removed_on_down(self):
+        self.g.up()
+        self.assertEqual(hid.applied_scroll(self.scroll_file), "smooth")
+        self.g.down()
+        self.assertFalse(os.path.exists(self.scroll_file))
+        self.assertEqual(hid.applied_scroll(self.scroll_file), "click")
+
+    def test_the_touchpad_fallback_keeps_the_scroll_mode(self):
+        real = hid.Gadget._put
+
+        def put(g, rel, value):
+            if rel == "UDC" and os.path.exists(os.path.join(g.root, "functions", "hid.usb3")):
+                raise OSError(errno.ENOSPC, "no endpoint")
+            return real(g, rel, value)
+
+        with mock.patch.object(hid.Gadget, "_put", put), mock.patch("sys.stderr"):
+            self.g.up(scroll="smooth")
+        self.assertFalse(os.path.exists(os.path.join(self.g.root, "functions", "hid.usb3")))
+        self.assertEqual(self.read("functions/hid.usb1/report_desc", "rb"), hid.MOUSE_HIRES_DESC)
+        self.assertEqual(hid.applied_scroll(self.scroll_file), "smooth")
 
     def test_status_when_not_bound(self):
         self.g.up()

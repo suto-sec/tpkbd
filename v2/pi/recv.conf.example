@@ -14,6 +14,12 @@
 # ctrlwheel: wheel clicks per doubling of the pinch distance
 # pinch_clicks = 6
 
+# Scrolling: smooth (high-resolution wheel: the page moves in small steps, like a laptop's
+# touchpad or a modern mouse) or click (whole wheel clicks, the plain descriptor that works
+# everywhere). The USB gadget is built with the choice, so after changing it run
+# `sudo systemctl restart tpkbd-gadget` (this also restarts the receiver)
+# scroll = smooth
+
 # the Pi's green LED: on, off, or activity (lit only while input is being forwarded).
 # Both links use it. It still blinks during boot, before this service starts
 # led = on
