@@ -43,6 +43,7 @@ USB_CHECK_S = 1.0           # how often the USB state is looked at, to tell the 
 
 LED_MODES = ("off", "on", "activity")
 LED_DEFAULT = "on"
+BAUD_DEFAULT = 115200     # the wire; the sender's `baud` must match
 LED_DIRS = ("/sys/class/leds/ACT", "/sys/class/leds/led0")  # new and old kernel names
 LED_FLASH_S = 0.08          # how long the LED stays lit after input in "activity" mode
 
@@ -86,6 +87,12 @@ def load_config(path=CONF_PATH):
     cfg["scroll"] = s.get("scroll", hid.SCROLL_DEFAULT).strip().lower()
     if cfg["scroll"] not in hid.SCROLL_MODES:
         raise ValueError(f"scroll must be one of {', '.join(hid.SCROLL_MODES)}, not {cfg['scroll']!r}")
+    try:
+        cfg["baud"] = int(s.get("baud", BAUD_DEFAULT))
+    except ValueError:
+        raise ValueError(f"baud must be a number, not {s.get('baud')!r}") from None
+    if not hasattr(termios, f"B{cfg['baud']}"):
+        raise ValueError(f"unsupported baud rate {cfg['baud']}")
     cfg["led"] = s.get("led", LED_DEFAULT).strip().lower()
     if cfg["led"] not in LED_MODES:
         raise ValueError(f"led must be one of {', '.join(LED_MODES)}, not {cfg['led']!r}")
@@ -427,7 +434,7 @@ def serial_reply(fd):
 def main():
     ap = argparse.ArgumentParser(description="Turn tpkbd protocol lines into USB HID reports.")
     ap.add_argument("--serial", metavar="PATH", help="read this serial port instead of stdin")
-    ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--baud", type=int, help=f"serial speed (default: baud in the config, {BAUD_DEFAULT})")
     ap.add_argument("--config", default=CONF_PATH)
     args = ap.parse_args()
     try:
@@ -458,8 +465,9 @@ def main():
     led = Led(cfg["led"])
     try:
         if args.serial:
-            fd = open_serial(args.serial, args.baud)
-            say(f"listening on {args.serial} at {args.baud} baud")
+            baud = args.baud or cfg["baud"]
+            fd = open_serial(args.serial, baud)
+            say(f"listening on {args.serial} at {baud} baud")
             serve(Replayer(kbd_out, mouse_out, cfg, reply=serial_reply(fd),
                            consumer_out=consumer_out, led=led, touch_out=touch_out,
                            usb_state=hid.udc_state),

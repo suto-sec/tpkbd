@@ -20,6 +20,12 @@
 # `sudo systemctl restart tpkbd-gadget` (this also restarts the receiver)
 # scroll = smooth
 
+# Speed of the wire to the ThinkPad. The sender's `baud` in /etc/tpkbd/tpkbd.conf must be the
+# same, or the sender reports "wrong baud rate". 460800 or 921600 shorten each line's trip; read
+# the "wire round trip" lines in `journalctl -u tpkbd-forward` (or tpkbd-soft) to compare.
+# Restart tpkbd-recv after changing it. See docs/wired.md before switching
+# baud = 115200
+
 # the Pi's green LED: on, off, or activity (lit only while input is being forwarded).
 # Both links use it. It still blinks during boot, before this service starts
 # led = on

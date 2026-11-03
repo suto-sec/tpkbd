@@ -201,6 +201,30 @@ def usb_problem(state):
 
 # ------------------------------------------------------------ ssh link
 
+class RoundTrips:
+    """Heartbeat round trips over the wire: sent line to `ok` answer, in milliseconds."""
+
+    def __init__(self):
+        self.pending = []           # monotonic send times of heartbeats not yet answered
+        self.samples = []
+
+    def sent(self, now=None):
+        self.pending.append(time.monotonic() if now is None else now)
+        del self.pending[:-8]       # answers lost on the wire must not pile up
+
+    def answered(self, now=None):
+        if self.pending:
+            t0 = self.pending.pop(0)
+            self.samples.append(((time.monotonic() if now is None else now) - t0) * 1000.0)
+
+    def take(self):
+        """(count, average, worst) since the last call, or None without a sample."""
+        samples, self.samples = self.samples, []
+        if not samples:
+            return None
+        return len(samples), sum(samples) / len(samples), max(samples)
+
+
 class Link:
     """The ssh connection to tpkbd-recv on the PC."""
 
@@ -347,6 +371,7 @@ class SerialLink(Link):
         self.ready = False
         self.last_rx = time.monotonic()
         self.rx_total = 0           # bytes ever received: 0 means the Pi never spoke
+        self.rtt = RoundTrips()
 
     @property
     def started(self):
@@ -371,6 +396,9 @@ class SerialLink(Link):
         if not lines or self.fd is None:
             return
         data = ("\n".join(lines) + "\n").encode()
+        for line in lines:
+            if line.startswith("h "):
+                self.rtt.sent()
         deadline = time.monotonic() + 2.0
         while data:
             try:
@@ -400,6 +428,9 @@ class SerialLink(Link):
         self._buf += chunk
         *lines, self._buf = self._buf.split(b"\n")
         lines = [x.decode(errors="replace").strip() for x in lines if x.strip()]
+        for line in lines:
+            if line == "ok":
+                self.rtt.answered()
         # heartbeat answers, and READY answers to a late `hello`, are not news
         return [x for x in lines if x != "ok" and not (self.ready and x.startswith("READY"))]
 
@@ -497,6 +528,8 @@ class SleepInhibitor:
 
 
 class Sender:
+    RTT_REPORT_S = 60.0
+
     def __init__(self, cfg, soft=False, link=None):
         self.cfg = cfg
         self.soft = soft
@@ -516,6 +549,7 @@ class Sender:
         self.next_hb = 0.0
         self.warn = RateLimited()
         self.inhibitor = SleepInhibitor(soft and cfg["inhibit_sleep"])
+        self.next_rtt_report = 0.0
 
     # devices
 
@@ -727,6 +761,20 @@ class Sender:
             self.next_hb = now + self.cfg["heartbeat_s"]
             if self.state == "remote":
                 self.inhibitor.hold()       # a no-op unless the lock was lost
+            self.report_round_trips(now)
+
+    def report_round_trips(self, now):
+        """Wired link only: the journal gets the wire's heartbeat round trip once a minute
+        (the first one right away), so a baud rate change can be judged by a number."""
+        rtt = getattr(self.link, "rtt", None)
+        if rtt is None or now < self.next_rtt_report:
+            return
+        stats = rtt.take()
+        if stats is None:
+            return
+        n, avg, worst = stats
+        log(f"wire round trip: average {avg:.1f} ms, worst {worst:.1f} ms ({n} heartbeats)")
+        self.next_rtt_report = now + self.RTT_REPORT_S
 
     # main loop
 

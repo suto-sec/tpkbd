@@ -62,7 +62,7 @@ Then use it for real: [boot-mode.md](boot-mode.md).
 - `tpkbd-recv.service` runs on the Pi at every boot, listening on `/dev/serial0`.
 - `tpkbd-send` says `hello` until the Pi answers `READY 2`, then grabs the ThinkPad's input. It sends a heartbeat every second; the Pi answers `ok`.
 - If nothing comes back for 5 s the sender treats the link as dead and systemd retries. If the Pi hears nothing for 3 s it releases every key and button.
-- The line protocol is the v1 one (`k`/`m`/`b`/`s`/`g`/`h`). The Pi also sends `usb <state>` (the kernel's UDC state) after `READY 2` and whenever it changes; the sender uses it for the messages above and older receivers simply never send it. The baud rate is 115200 on both sides; change `baud` in `tpkbd.conf` and `--baud` in the unit together if the pointer lags.
+- The line protocol is the v1 one (`k`/`m`/`b`/`s`/`g`/`h`). The Pi also sends `usb <state>` (the kernel's UDC state) after `READY 2` and whenever it changes; the sender uses it for the messages above and older receivers simply never send it. The baud rate is 115200 on both sides by default; see [Speed](#speed).
 
 ## If it doesn't connect
 
@@ -84,6 +84,18 @@ The sender says in words what is wrong. It tells three problems apart: the adapt
 When the link is up but the PC's USB is not, keyboard mode still takes over the keyboard and warns you (hold Left Ctrl + Right Ctrl + Esc to get it back); the keys just do not reach the PC until the PC's USB comes up. The same `PC USB problem` text is shown in `systemctl status tpkbd-forward`.
 
 If the symptoms are vague: swap the TX and RX wires, check GND is on pin 6, and run the loopback test. Connects-then-drops is usually a loose jumper or a long, poor USB extension to the adapter.
+
+## Speed
+
+Each protocol line is about 20 bytes, so at 115200 baud it takes about 2 ms on the wire. The sender writes `wire round trip: average ... ms, worst ... ms` to the journal a few seconds after connecting and then once a minute (`journalctl -u tpkbd-forward`, or `tpkbd-soft`). It is the time from a heartbeat to the Pi's `ok`, so it covers the wire and the Pi's receiver, not the USB link to the PC.
+
+To try a faster wire, change **both** sides, then restart them:
+
+1. Pi: `baud = 460800` in `/etc/tpkbd/recv.conf`, then `sudo systemctl restart tpkbd-recv`. (This ends the link until the sender matches.)
+2. ThinkPad: `baud = 460800` in `/etc/tpkbd/tpkbd.conf`, then restart the sender service.
+3. Read the round-trip line. If the sender says `wrong baud rate` or the link drops, set both back to 115200.
+
+Notes: the CP2102 supports up to 921600. The Pi's mini-UART (what `/dev/serial0` is while Bluetooth is on) ties its speed to the core clock, so after `harden.sh --bluetooth` and a reboot, where `serial0` is the full PL011 UART, high speeds are more reliable. Change the baud rate **before** `harden.sh --wifi-off` and the read-only filesystem: if the two sides disagree you need SSH (or an SD-card edit) to fix it.
 
 ## Security
 

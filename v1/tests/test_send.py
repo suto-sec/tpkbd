@@ -369,6 +369,67 @@ class SoftToggle(unittest.TestCase):
                 send.STATE_PATH = old
 
 
+class WireRoundTrip(unittest.TestCase):
+    def test_answer_matches_the_oldest_heartbeat(self):
+        r = send.RoundTrips()
+        r.sent(10.0)
+        r.sent(11.0)
+        r.answered(10.004)
+        r.answered(11.010)
+        n, avg, worst = r.take()
+        self.assertEqual(n, 2)
+        self.assertAlmostEqual(avg, 7.0, places=3)
+        self.assertAlmostEqual(worst, 10.0, places=3)
+        self.assertIsNone(r.take())
+
+    def test_unmatched_answer_is_ignored(self):
+        r = send.RoundTrips()
+        r.answered()
+        self.assertIsNone(r.take())
+
+    def test_lost_answers_do_not_pile_up(self):
+        r = send.RoundTrips()
+        for i in range(50):
+            r.sent(float(i))
+        self.assertEqual(len(r.pending), 8)
+
+    def test_serial_link_measures_heartbeats_only(self):
+        import pty
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        link = send.SerialLink(send.load_config("/nonexistent"))
+        link.fd = slave
+        self.addCleanup(link.close)
+        link.send(["k 0 0 1", "h 5"])
+        self.assertEqual(len(link.rtt.pending), 1)
+        os.write(master, b"ok\n")
+        import time
+        end = time.monotonic() + 2
+        while time.monotonic() < end and not link.rtt.samples:
+            link.read_lines()
+        self.assertEqual(len(link.rtt.samples), 1)
+
+    def test_sender_reports_the_first_one_right_away_then_every_minute(self):
+        s = make(soft=True)
+        s.link.rtt = send.RoundTrips()
+        logged = []
+        old, send.log = send.log, logged.append
+        try:
+            s.link.rtt.samples = [4.0, 6.0]
+            s.report_round_trips(100.0)
+            s.link.rtt.samples = [8.0]
+            s.report_round_trips(130.0)         # too soon
+            s.report_round_trips(161.0)
+        finally:
+            send.log = old
+        self.assertEqual(len(logged), 2)
+        self.assertIn("average 5.0 ms, worst 6.0 ms (2 heartbeats)", logged[0])
+
+    def test_no_report_on_the_ssh_link(self):
+        s = make(soft=True)         # FakeLink has no round trips
+        s.report_round_trips(100.0)
+
+
 class SleepLock(unittest.TestCase):
     """The logind lock is a `sleep` child; a `sleep` command stands in for systemd-inhibit."""
 

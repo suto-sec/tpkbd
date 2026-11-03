@@ -363,7 +363,8 @@ class Config(unittest.TestCase):
     def test_defaults_without_a_file(self):
         cfg = recv.load_config("/nonexistent/recv.conf")
         self.assertEqual(cfg, {"scale": 1.0, "pinch_clicks": 6.0, "watchdog_s": 3.0, "dead_s": 30.0,
-                               "half0": 400.0, "pinch": "touchpad", "led": "on", "scroll": "smooth"})
+                               "half0": 400.0, "pinch": "touchpad", "led": "on", "scroll": "smooth",
+                                "baud": 115200})
 
     def test_override(self):
         with tempfile.TemporaryDirectory() as d:
@@ -388,6 +389,27 @@ class ScrollSetting(unittest.TestCase):
             with open(path, "w") as f:
                 f.write("[receiver]\nscroll = click\n")
             self.assertEqual(recv.load_config(path)["scroll"], "click")
+
+
+class BaudSetting(unittest.TestCase):
+    def conf(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "recv.conf")
+            with open(path, "w") as f:
+                f.write("[receiver]\n" + text)
+            return recv.load_config(path)
+
+    def test_default_is_the_old_speed(self):
+        self.assertEqual(self.conf("")["baud"], 115200)
+
+    def test_faster_speed(self):
+        self.assertEqual(self.conf("baud = 460800\n")["baud"], 460800)
+
+    def test_nonsense_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "unsupported baud"):
+            self.conf("baud = 12345\n")
+        with self.assertRaisesRegex(ValueError, "baud must be a number"):
+            self.conf("baud = fast\n")
 
 
 class Serve(unittest.TestCase):

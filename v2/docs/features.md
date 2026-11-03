@@ -33,6 +33,23 @@ On the Pi, `/etc/tpkbd/recv.conf` (the UART service) or `~/.config/tpkbd/recv.co
 
 On the ThinkPad, `/etc/tpkbd/tpkbd.conf` (`link`, `serial_port`, `baud`, the device names, `block_keys`, `escape_keys`, `toggle_keys`), from `v1/thinkpad/tpkbd.conf.example`.
 
+## Tuning the touchpad and TrackPoint feel
+
+The ThinkPad's libinput processes the pointer before it is sent, so its options apply to the PC too. They go in `libinput_opts` in `/etc/tpkbd/tpkbd.conf` (restart the sender service after a change). The default is `--set-profile=adaptive --set-speed=0 --enable-tap --disable-dwt`. If you set it, repeat the options you want to keep.
+
+| Want | Add |
+|---|---|
+| Natural (reversed) scrolling | `--enable-natural-scrolling` |
+| Faster or slower pointer (-1 to 1) | `--set-speed=0.4` (or `scale` in `recv.conf` for a plain multiplier) |
+| Flat acceleration (mouse-like, predictable) | `--set-profile=flat` |
+| Tap and drag, drag lock | `--enable-drag`, `--enable-drag-lock` |
+| Three-finger drag (move a window or select text without a button) | `--enable-3fg-drag` |
+| Click with fingers instead of the pad's corners | `--set-click-method=clickfinger` |
+| Middle click by pressing left and right together | `--enable-middlebutton` |
+| Pointer ignores the touchpad while typing | `--enable-dwt` (off by default: the PC, not the laptop, would not know) |
+
+`libinput debug-events --help` lists every option. Try a change by running the same options by hand first: `sudo libinput debug-events --enable-natural-scrolling` and watch the events.
+
 ## Lights
 
 | Light | Can software change it? |
