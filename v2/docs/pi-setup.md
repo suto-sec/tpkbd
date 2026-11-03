@@ -161,4 +161,5 @@ Record which BIOS you tried, whether it saw the keyboard, and whether the mouse 
 - [wired.md](wired.md): the UART wire (the real setup).
 - [wifi.md](wifi.md): SSH over Wi-Fi (temporary, easier to start with).
 - [boot-mode.md](boot-mode.md): boot the ThinkPad straight into keyboard mode.
+- [hardening.md](hardening.md): once everything works, Bluetooth off, key-only SSH, read-only root.
 - [features.md](features.md): what is forwarded, and what isn't.

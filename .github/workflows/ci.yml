@@ -32,7 +32,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          shellcheck pi/install.sh pi/uninstall.sh
+          shellcheck pi/install.sh pi/uninstall.sh pi/harden.sh
       - name: python-evdev, for the wire tests
         run: sudo apt-get install -y -qq python3-evdev
       - name: compile the scripts

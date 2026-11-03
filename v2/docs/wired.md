@@ -87,4 +87,4 @@ If the symptoms are vague: swap the TX and RX wires, check GND is on pin 6, and 
 
 ## Security
 
-The wire is not authenticated: anything that can write to the Pi's serial port can type on the target. Keep it short and private. For the final wired-only product also consider `dtoverlay=disable-wifi` and `dtoverlay=disable-bt` on the Pi (after you no longer need SSH over Wi-Fi) and key-only SSH.
+The wire is not authenticated: anything that can write to the Pi's serial port can type on the target. Keep it short and private. For the final wired-only product, `pi/harden.sh` turns off Bluetooth, password SSH logins and (last, separately) Wi-Fi: see [hardening.md](hardening.md).

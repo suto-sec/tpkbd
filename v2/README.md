@@ -31,6 +31,7 @@ The ThinkPad sender (`v1/thinkpad/`) is **shared by v1 and v2**. It lives under 
 2. [docs/wired.md](docs/wired.md) (recommended) or [docs/wifi.md](docs/wifi.md): connect the ThinkPad.
 3. [docs/boot-mode.md](docs/boot-mode.md): keyboard mode, soft mode, a GRUB entry that boots into it.
 4. [docs/features.md](docs/features.md): what is forwarded, settings, limits.
+5. [docs/hardening.md](docs/hardening.md): when it all works, lock the Pi down.
 
 ## What is in this folder
 
@@ -39,6 +40,7 @@ The ThinkPad sender (`v1/thinkpad/`) is **shared by v1 and v2**. It lives under 
 | `pi/tpkbd-hid` | Creates the USB gadget (configfs), the HID report builders, the self-test |
 | `pi/tpkbd-recv` | Turns the line protocol into USB reports; stdin (SSH) or serial (UART) |
 | `pi/install.sh`, `pi/uninstall.sh` | Install or remove everything on the Pi |
+| `pi/harden.sh` | Optional: Bluetooth off, key-only SSH, Wi-Fi off ([docs/hardening.md](docs/hardening.md)) |
 | `pi/*.service`, `pi/*.rules`, `pi/*.conf` | systemd units, udev rule, module list |
 | `pi/recv.conf.example`, `pi/authorized_keys.example` | Receiver settings, the SSH forced-command line |
 | `docs/` | The guides above |
@@ -58,6 +60,7 @@ Run the tests from this folder: `python3 -m unittest discover -s tests -t .` (th
 | Pinch as a virtual touchpad (zoom around the pointer) | Verified on real hardware |
 | Horizontal scroll | Written and unit-tested; **not yet tried on hardware** |
 | Smooth (high-resolution) scrolling, `scroll = smooth` | Written and unit-tested; **not yet tried on hardware** (`scroll = click` is the verified descriptor) |
+| `harden.sh` (Bluetooth, key-only SSH, Wi-Fi off) | Written and tested against stubs; **not yet run on the Pi** |
 | Booting the ThinkPad into keyboard mode from GRUB | Documented, not yet tried |
 | Typing in a real BIOS on the target over the wire | Verified on real hardware, also with the current four-function gadget (GRUB not tried) |
 | Pointer speed (`scale`) tuned for a real USB mouse | Default 1.0, not tuned |
