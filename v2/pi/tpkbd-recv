@@ -39,6 +39,8 @@ DEFAULTS = {
 PINCH_MODES = ("touchpad", "ctrlwheel")
 PINCH_DEFAULT = "touchpad"
 
+USB_CHECK_S = 1.0           # how often the USB state is looked at, to tell the sender when it changes
+
 LED_MODES = ("off", "on", "activity")
 LED_DEFAULT = "on"
 LED_DIRS = ("/sys/class/leds/ACT", "/sys/class/leds/led0")  # new and old kernel names
@@ -153,13 +155,16 @@ class Replayer:
     """Protocol lines in, HID reports out. A host that isn't reading is not an error."""
 
     def __init__(self, kbd_out, mouse_out, cfg, reply=None, consumer_out=None, led=None,
-                 touch_out=None):
+                 touch_out=None, usb_state=None):
         self.kbd_out, self.mouse_out = kbd_out, mouse_out
         self.consumer_out = consumer_out    # media keys; None if the gadget predates them
         self.touch_out = touch_out  # pinch as two fingers on a touchpad; None: Ctrl + wheel
         if cfg.get("pinch", PINCH_DEFAULT) == "ctrlwheel":
             self.touch_out = None
         self.led = led              # Led or None
+        self.usb_state = usb_state  # callable -> the USB controller's state; reported to the sender
+        self.usb_sent = None        # the last state reported (None: report again)
+        self.usb_checked = 0.0
         self.reply = reply          # writes a line back to the sender (serial mode only)
         self.scale = cfg["scale"]
         self.pinch_clicks = cfg.get("pinch_clicks", 6.0)
@@ -174,6 +179,27 @@ class Replayer:
         self.pinching = False
         self.pinch_sent = 0         # wheel clicks already sent for the current pinch
         self.write_errors = 0
+
+    def tick(self, now, force=False):
+        """Called by serve() between reads: the LED, and the USB state for the sender."""
+        if self.led is not None:
+            self.led.tick(now)
+        if self.usb_state is None or self.reply is None:
+            return
+        if force or now - self.usb_checked >= USB_CHECK_S:
+            self.usb_checked = now
+            state = self.usb_state()
+            if state != self.usb_sent:
+                self.usb_sent = state
+                self.reply(f"usb {state}")
+
+    def timeout(self, now, default):
+        """How long serve() may sleep."""
+        if self.led is not None:
+            default = self.led.timeout(now, default)
+        if self.usb_state is not None and self.reply is not None:
+            default = min(default, max(0.01, self.usb_checked + USB_CHECK_S - now))
+        return default
 
     def release_all(self):
         """Let go of everything: used when the sender goes quiet or disconnects."""
@@ -198,6 +224,8 @@ class Replayer:
         if self.reply is not None:
             if p == ["hello"]:
                 self.reply(f"READY {PROTO}")
+                self.usb_sent = None        # a sender that just arrived wants to know now
+                self.tick(time.monotonic(), force=True)
                 return
             if p[:1] == ["h"]:
                 self.reply("ok")
@@ -326,17 +354,14 @@ def serve(rp, fd, watchdog_s, dead_s):
     last = time.monotonic()
     released = True  # nothing pressed yet
     while True:
-        wait = min(0.5, max(0.01, watchdog_s / 4))
-        if rp.led is not None:
-            wait = rp.led.timeout(time.monotonic(), wait)
+        wait = rp.timeout(time.monotonic(), min(0.5, max(0.01, watchdog_s / 4)))
         try:
             r, _, _ = select.select([fd], [], [], wait)
         except OSError as err:
             say(f"port failed: {err}")
             break
         now = time.monotonic()
-        if rp.led is not None:
-            rp.led.tick(now)
+        rp.tick(now)
         if r:
             try:
                 data = os.read(fd, 65536)
@@ -426,7 +451,8 @@ def main():
             fd = open_serial(args.serial, args.baud)
             say(f"listening on {args.serial} at {args.baud} baud")
             serve(Replayer(kbd_out, mouse_out, cfg, reply=serial_reply(fd),
-                           consumer_out=consumer_out, led=led, touch_out=touch_out),
+                           consumer_out=consumer_out, led=led, touch_out=touch_out,
+                           usb_state=hid.udc_state),
                   fd, cfg["watchdog_s"], 0)
             return
         print(f"READY {PROTO}", flush=True)

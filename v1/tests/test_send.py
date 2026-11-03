@@ -196,6 +196,45 @@ class LinkReady(unittest.TestCase):
         self.assertEqual(logged, ["got h 1"])
 
 
+class UsbReports(unittest.TestCase):
+    def setUp(self):
+        self.logged = []
+        self._log, send.log = send.log, self.logged.append
+
+    def tearDown(self):
+        send.log = self._log
+
+    def test_a_problem_is_logged_once_and_shown_in_status(self):
+        s = make()
+        s.on_pc_line("usb not attached")
+        s.on_pc_line("usb not attached")
+        self.assertEqual(len(self.logged), 1)
+        self.assertIn("PC USB problem", self.logged[0])
+        self.assertIn("not reach the PC", self.logged[0])
+        self.assertIn("but", s.status_text())
+
+    def test_recovery_is_logged(self):
+        s = make()
+        s.on_pc_line("usb suspended")
+        s.on_pc_line("usb configured")
+        self.assertEqual(self.logged[-1], "PC USB link is up")
+        self.assertEqual(s.status_text(), s.state)
+
+    def test_other_pc_lines_are_just_logged(self):
+        s = make()
+        s.on_pc_line("ok")
+        self.assertEqual(self.logged, ["pc: ok"])
+        self.assertIsNone(s.usb_state)
+
+    def test_a_bare_usb_word_is_not_a_state(self):
+        s = make()
+        s.on_pc_line("usb")
+        self.assertIsNone(s.usb_state)
+
+    def test_no_state_means_no_complaint(self):
+        self.assertEqual(make().status_text(), "local")
+
+
 class KeyboardMode(unittest.TestCase):
     def test_keys_are_forwarded_in_batches(self):
         s = make(state="remote")

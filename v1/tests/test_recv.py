@@ -50,6 +50,11 @@ class Keyboard(unittest.TestCase):
         feed(rp, "h 12345", "", "x 1 2 3", "m 1", "k a b c")
         self.assertEqual((kbd.events, ptr.events, pinch.events), ([], [], []))
 
+    def test_lines_from_newer_senders_are_ignored(self):
+        rp, kbd, ptr, pinch = make()
+        feed(rp, "usb configured", "usb not attached", "a 1 2 3", "c 5 hello world", "READY 2")
+        self.assertEqual((kbd.events, ptr.events, pinch.events), ([], [], []))
+
     def test_release_all_lets_go_of_held_keys_and_buttons(self):
         rp, kbd, ptr, _ = make()
         feed(rp, "k 1 30 1", "k 0 0 1", "k 1 29 1", "k 0 0 2", "b 272 1 3")

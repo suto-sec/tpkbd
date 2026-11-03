@@ -10,6 +10,7 @@
 # Needs read/write access to /dev/input (root, or a user in the "input" group).
 # Settings live in /etc/tpkbd/tpkbd.conf, see thinkpad/tpkbd.conf.example.
 import argparse
+import errno
 import configparser
 import os
 import pty
@@ -180,6 +181,21 @@ def sd_notify(msg):
         pass
 
 
+# What the Pi tells us about its USB link to the PC (`usb <state>`), in plain words.
+USB_PROBLEMS = {
+    "suspended": "the PC is asleep (its USB is suspended)",
+    "not attached": "the Pi's USB gets no link from the PC (cable unplugged or bad, or the PC is off)",
+    "no-controller": "the Pi has no USB device controller (is dtoverlay=dwc2 set in its config.txt?)",
+}
+
+
+def usb_problem(state):
+    """None if the PC has set the Pi's USB up, else a sentence saying what is wrong."""
+    if state == "configured":
+        return None
+    return USB_PROBLEMS.get(state, f"the PC has not finished setting up the Pi's USB (state: {state})")
+
+
 # ------------------------------------------------------------ ssh link
 
 class Link:
@@ -200,6 +216,12 @@ class Link:
         self._buf = b""
 
     NUDGE_S = 1.0       # wait_ready calls nudge() this often while waiting
+
+    def timeout_message(self):
+        return "PC not reachable or receiver not ready (will retry)"
+
+    def lost_reason(self):
+        return "the ssh connection closed"
 
     @property
     def started(self):
@@ -242,7 +264,7 @@ class Link:
         while True:
             left = deadline - time.monotonic()
             if left <= 0:
-                raise LinkError("PC not reachable or receiver not ready (will retry)")
+                raise LinkError(self.timeout_message())
             r, _, _ = select.select([self.fd], [], [], min(left, self.NUDGE_S))
             if not r:
                 self.nudge()
@@ -260,7 +282,7 @@ class Link:
                 else:
                     return
             if self.eof:
-                raise LinkError("PC not reachable or receiver not ready (will retry)")
+                raise LinkError(self.timeout_message())
 
     def close(self):
         if self.proc is None:
@@ -285,7 +307,13 @@ def open_serial(path, baud):
     try:
         fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     except OSError as err:
-        raise LinkError(f"cannot open {path}: {err.strerror}") from err
+        hint = ""
+        if err.errno == errno.ENOENT:
+            hint = (": the USB-serial adapter is not detected by this laptop. Replug it, and check "
+                    "that `lsusb` lists it (a CP2102 is 10c4:ea60) and `ls /dev/ttyUSB*` shows the port")
+        elif err.errno == errno.EACCES:
+            hint = ": no permission; the tpkbd user must be in the uucp (Arch) or dialout group"
+        raise LinkError(f"cannot open {path}: {err.strerror}{hint}") from err
     try:
         attrs = termios.tcgetattr(fd)
         speed = getattr(termios, f"B{baud}")
@@ -309,11 +337,13 @@ class SerialLink(Link):
 
     DEAD_S = 5.0
     NUDGE_S = 0.5
+    USB_WAIT_S = 0.3        # the Pi's `usb` line follows READY within milliseconds
 
     def __init__(self, cfg):
         super().__init__(cfg, argv=[])
         self.ready = False
         self.last_rx = time.monotonic()
+        self.rx_total = 0           # bytes ever received: 0 means the Pi never spoke
 
     @property
     def started(self):
@@ -363,16 +393,43 @@ class SerialLink(Link):
             self.eof = True
             return []
         self.last_rx = time.monotonic()
+        self.rx_total += len(chunk)
         self._buf += chunk
         *lines, self._buf = self._buf.split(b"\n")
         lines = [x.decode(errors="replace").strip() for x in lines if x.strip()]
         # heartbeat answers, and READY answers to a late `hello`, are not news
         return [x for x in lines if x != "ok" and not (self.ready and x.startswith("READY"))]
 
+    def timeout_message(self):
+        port = self.cfg["serial_port"]
+        if self.eof:
+            return f"{port} went away while waiting: the USB-serial adapter was unplugged or failed"
+        if self.rx_total == 0:
+            return (f"the Pi did not answer on {port}. It may still be booting (it starts together "
+                    "with the PC and needs about 30 s), the Pi may be unpowered (is the PC on?), "
+                    "the TX/RX wires may be swapped or loose, or tpkbd-recv is not running on the Pi "
+                    "(systemctl status tpkbd-recv). Will retry")
+        return (f"{port} receives data but no READY: wrong baud rate (set to {self.cfg['baud']}), "
+                "a wire picking up noise, or the Pi runs another program on its serial port. Will retry")
+
+    def lost_reason(self):
+        if self.eof:
+            return "the USB-serial adapter was unplugged or failed"
+        return ("the Pi stopped answering for %d s: it lost power (the PC shut down or its USB port "
+                "was switched off), it is rebooting, or its receiver crashed" % self.DEAD_S)
+
     def wait_ready(self, timeout, log=log):
         super().wait_ready(timeout, log)
         self.ready = True
         self.last_rx = time.monotonic()
+        # the Pi follows READY with `usb <state>`; give it a moment so the first words
+        # we log can already say whether the PC is listening. Older receivers say nothing.
+        self.first_usb = []
+        deadline = time.monotonic() + self.USB_WAIT_S
+        while not self.first_usb and time.monotonic() < deadline:
+            r, _, _ = select.select([self.fd], [], [], 0.05)
+            if r:
+                self.first_usb = [x for x in self.read_lines() if x.startswith("usb ")]
 
     def close(self):
         if self.fd is not None:
@@ -404,6 +461,7 @@ class Sender:
         self.master = None
         self.li_buf = b""
         self.state = "local"
+        self.usb_state = None       # what the Pi reports about its USB link to the PC
         self.want = None            # "remote"/"local": toggle waiting for all keys up
         self.held = set()           # physical keys currently down
         self.forwarded = set()      # keys the PC currently sees as down
@@ -486,11 +544,33 @@ class Sender:
 
     # state
 
+    def status_text(self):
+        problem = usb_problem(self.usb_state) if self.usb_state else None
+        return self.state + (f" - but {problem}" if problem else "")
+
+    def note_usb(self, state):
+        """The Pi told us the state of its USB link to the PC."""
+        if state == self.usb_state:
+            return
+        self.usb_state = state
+        problem = usb_problem(state)
+        if problem:
+            log(f"PC USB problem: {problem}; keys and mouse will not reach the PC until this clears")
+        else:
+            log("PC USB link is up")
+        sd_notify(f"STATUS={self.status_text()}")
+
+    def on_pc_line(self, line):
+        if line.startswith("usb ") and len(line.split()) >= 2:
+            self.note_usb(line[4:].strip())
+        else:
+            log(f"pc: {line}")
+
     def set_state(self, state):
         self.state = state
         if not self.soft:
             return
-        sd_notify(f"STATUS={state}")
+        sd_notify(f"STATUS={self.status_text()}")
         try:
             with open(STATE_PATH, "w") as f:
                 f.write(state + "\n")
@@ -605,11 +685,15 @@ class Sender:
         self.link = make_link(self.cfg)
         self.link.start()
         self.link.wait_ready(self.cfg["ready_timeout"])  # nothing is grabbed before this
+        for line in getattr(self.link, "first_usb", []):
+            self.on_pc_line(line)
         if not self.soft:
+            if self.usb_state and usb_problem(self.usb_state):
+                log("WARNING: taking over the keyboard anyway; hold both Ctrl + Esc to stop")
             self.enter_remote()
         log(f"CONNECTED after {time.monotonic() - t0:.1f} s " +
             ("(toggle with the hotkey)" if self.soft else "(hold both Ctrl + Esc to stop)"))
-        sd_notify("READY=1\nSTATUS=" + self.state)
+        sd_notify("READY=1\nSTATUS=" + self.status_text())
         kbd_fds = {d.fd: d for d in self.kbds}
         while True:
             fds = list(kbd_fds)
@@ -624,14 +708,15 @@ class Sender:
                     self.handle_libinput()
                 elif fd == self.link.fd:
                     for line in self.link.read_lines():
-                        log(f"pc: {line}")
+                        self.on_pc_line(line)
                 else:
                     for ev in kbd_fds[fd].read():
                         self.handle_key(ev)
             self.apply_toggle()
             self.heartbeat(time.monotonic())
             if self.link.poll() is not None:
-                log("connection lost")
+                why = getattr(self.link, "lost_reason", lambda: "")()
+                log("connection lost" + (f": {why}" if why else ""))
                 sys.exit(1)
             if self.li is not None and self.li.poll() is not None:
                 log("libinput stopped")

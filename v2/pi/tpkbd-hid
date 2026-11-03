@@ -463,6 +463,20 @@ class Gadget:
         return f"{udc}: {state}"
 
 
+def udc_state(udc_dir="/sys/class/udc"):
+    """State of the USB device controller as the kernel reports it: 'configured' means the
+    computer has set the gadget up; 'not attached' no cable or no power from the computer;
+    'suspended' the computer is asleep. 'no-controller' if there is none."""
+    try:
+        names = sorted(os.listdir(udc_dir))
+        if not names:
+            return "no-controller"
+        with open(os.path.join(udc_dir, names[0], "state")) as f:
+            return f.read().strip() or "unknown"
+    except OSError:
+        return "no-controller"
+
+
 # self-test
 
 def key_tap(kb, out, code, sleep):

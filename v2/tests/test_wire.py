@@ -5,6 +5,7 @@ import pty
 import threading
 import time
 import unittest
+from unittest import mock
 
 from tests.loader import load
 
@@ -68,6 +69,7 @@ class Wire(unittest.TestCase):
     def connect(self):
         self.link = send.make_link(self.cfg())
         self.link.start()
+        self.link.USB_WAIT_S = 0    # the tests' receiver has a short watchdog and says no `usb`
         self.link.wait_ready(5, log=print)
 
     def wait_for(self, cond, secs=3):

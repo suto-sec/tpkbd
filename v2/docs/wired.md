@@ -62,16 +62,28 @@ Then use it for real: [boot-mode.md](boot-mode.md).
 - `tpkbd-recv.service` runs on the Pi at every boot, listening on `/dev/serial0`.
 - `tpkbd-send` says `hello` until the Pi answers `READY 2`, then grabs the ThinkPad's input. It sends a heartbeat every second; the Pi answers `ok`.
 - If nothing comes back for 5 s the sender treats the link as dead and systemd retries. If the Pi hears nothing for 3 s it releases every key and button.
-- The line protocol is the v1 one (`k`/`m`/`b`/`s`/`g`/`h`). The baud rate is 115200 on both sides; change `baud` in `tpkbd.conf` and `--baud` in the unit together if the pointer lags.
+- The line protocol is the v1 one (`k`/`m`/`b`/`s`/`g`/`h`). The Pi also sends `usb <state>` (the kernel's UDC state) after `READY 2` and whenever it changes; the sender uses it for the messages above and older receivers simply never send it. The baud rate is 115200 on both sides; change `baud` in `tpkbd.conf` and `--baud` in the unit together if the pointer lags.
 
 ## If it doesn't connect
 
-| Symptom | Check |
+The sender says in words what is wrong. It tells three problems apart: the adapter on the laptop, the Pi, and the Pi's USB link to the PC.
+
+| Message (from `journalctl -u tpkbd-forward` or the terminal) | Meaning and fix |
 |---|---|
-| `PC not reachable or receiver not ready` | The Pi isn't answering: `systemctl status tpkbd-recv` on the Pi, is `/dev/serial0` the port in the unit, is the serial console really off (steps 2 and 3)? |
-| `cannot open /dev/ttyUSB0` | Wrong name (`dmesg \| tail` after plugging in), or you aren't in the serial group (log in again). |
-| Nothing at all | Swap the TX and RX wires; check GND is on pin 6; run the loopback test. |
-| Connects, then drops | Loose jumper wire; a long or poor USB extension to the adapter. |
+| `USB-serial adapter is not detected` | No `/dev/ttyUSB0`. Replug the CP2102 (after a BIOS change it may not enumerate until replugged); `lsusb` should list `10c4:ea60`. |
+| `tpkbd user must be in the uucp/dialout group` | No permission on the adapter: add the service user to that group. |
+| `went away while waiting: the USB-serial adapter was unplugged or failed` | The adapter vanished during the wait. |
+| `the Pi did not answer` | Nothing came back. The Pi is still booting (about 30 s after the PC starts), unpowered (is the PC on?), TX/RX are swapped or loose, or `tpkbd-recv` is down (`systemctl status tpkbd-recv` on the Pi). |
+| `receives data but no READY` | Bytes arrive but not the handshake: wrong baud rate, a noisy wire, or another program on the Pi's serial port. |
+| `PC USB problem: the PC is asleep` | The Pi is fine, the PC suspended its USB. Wake the PC. |
+| `PC USB problem: the Pi's USB gets no link from the PC` | The Pi is fine, its data cable is unplugged or bad, or the PC is off. |
+| `PC USB problem: the PC has not finished setting up the Pi's USB (state: ...)` | The PC is still enumerating (BIOS, boot). Normally clears in seconds. |
+| `PC USB problem: the Pi has no USB device controller` | `dtoverlay=dwc2` is missing in the Pi's `config.txt`. |
+| `connection lost: the Pi stopped answering` | The Pi lost power or rebooted, or its receiver crashed. |
+
+When the link is up but the PC's USB is not, keyboard mode still takes over the keyboard and warns you (hold Left Ctrl + Right Ctrl + Esc to get it back); the keys just do not reach the PC until the PC's USB comes up. The same `PC USB problem` text is shown in `systemctl status tpkbd-forward`.
+
+If the symptoms are vague: swap the TX and RX wires, check GND is on pin 6, and run the loopback test. Connects-then-drops is usually a loose jumper or a long, poor USB extension to the adapter.
 
 ## Security
 
