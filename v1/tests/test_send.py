@@ -33,6 +33,10 @@ class OfflineSender(send.Sender):
 
     grabbed = False
 
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        self.inhibitor = send.SleepInhibitor(False)     # never take a real logind lock in tests
+
     def _grab_all(self):
         self.grabbed = True
 
@@ -361,6 +365,79 @@ class SoftToggle(unittest.TestCase):
                     self.assertEqual(f.read(), "remote\n")
             finally:
                 send.STATE_PATH = old
+
+
+class SleepLock(unittest.TestCase):
+    """The logind lock is a `sleep` child; a `sleep` command stands in for systemd-inhibit."""
+
+    def make(self, enabled=True, cmd=("sleep", "30")):
+        lock = send.SleepInhibitor(enabled, cmd=list(cmd))
+        self.addCleanup(lock.release)
+        return lock
+
+    def test_held_then_released(self):
+        lock = self.make()
+        self.assertFalse(lock.held)
+        lock.hold()
+        self.assertTrue(lock.held)
+        lock.release()
+        self.assertFalse(lock.held)
+        lock.release()      # twice is fine
+
+    def test_hold_twice_is_one_process(self):
+        lock = self.make()
+        lock.hold()
+        first = lock.proc
+        lock.hold()
+        self.assertIs(lock.proc, first)
+
+    def test_retaken_when_the_child_died(self):
+        lock = self.make()
+        lock.hold()
+        lock.proc.kill()
+        lock.proc.wait()
+        self.assertFalse(lock.held)
+        lock.hold()
+        self.assertTrue(lock.held)
+
+    def test_disabled_never_starts(self):
+        lock = self.make(enabled=False)
+        lock.hold()
+        self.assertIsNone(lock.proc)
+
+    def test_missing_program_is_not_fatal(self):
+        lock = self.make(cmd=("/nonexistent/systemd-inhibit",))
+        lock.hold()
+        self.assertFalse(lock.held)
+
+    def test_config_default_and_off(self):
+        self.assertTrue(send.load_config("/nonexistent")["inhibit_sleep"])
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "tpkbd.conf")
+            with open(path, "w") as f:
+                f.write("[sender]\ninhibit_sleep = no\n")
+            self.assertFalse(send.load_config(path)["inhibit_sleep"])
+
+    def test_soft_toggle_holds_only_while_remote(self):
+        s = make(soft=True)
+        s.inhibitor = self.make()
+        s.enter_remote()
+        self.assertTrue(s.inhibitor.held)
+        s.leave_remote()
+        self.assertFalse(s.inhibitor.held)
+
+    def test_shutdown_lets_go(self):
+        s = make(soft=True)
+        s.inhibitor = self.make()
+        s.enter_remote()
+        s.shutdown()
+        self.assertFalse(s.inhibitor.held)
+
+    def test_keyboard_mode_has_no_lock(self):
+        s = make(soft=False)
+        s.enter_remote()
+        self.assertFalse(s.inhibitor.enabled)
+        self.assertFalse(s.inhibitor.held)
 
 
 class Heartbeat(unittest.TestCase):

@@ -28,3 +28,6 @@
 # escape_keys = KEY_LEFTCTRL KEY_RIGHTCTRL KEY_ESC
 # soft mode: this chord switches between this laptop and the PC
 # toggle_keys = KEY_LEFTCTRL KEY_RIGHTCTRL KEY_SPACE
+# soft mode: hold a systemd sleep/idle inhibitor while input goes to the PC, so the laptop
+# does not suspend in a long PC session (closing the lid still works as configured)
+# inhibit_sleep = yes

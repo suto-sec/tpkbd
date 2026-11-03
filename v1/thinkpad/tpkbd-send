@@ -46,6 +46,8 @@ DEFAULTS = {
     "block_keys": "KEY_SLEEP KEY_SUSPEND KEY_WAKEUP KEY_POWER",
     "escape_keys": "KEY_LEFTCTRL KEY_RIGHTCTRL KEY_ESC",
     "toggle_keys": "KEY_LEFTCTRL KEY_RIGHTCTRL KEY_SPACE",
+    # soft mode: keep this laptop from suspending while input goes to the PC
+    "inhibit_sleep": "yes",
 }
 
 # libinput debug-events output. Repeated events get a counter column before
@@ -112,6 +114,7 @@ def load_config(path=CONF_PATH):
         "block_keys": key_codes(s["block_keys"]),
         "escape_keys": key_codes(s["escape_keys"]),
         "toggle_keys": key_codes(s["toggle_keys"]),
+        "inhibit_sleep": s.getboolean("inhibit_sleep"),
     }
 
 
@@ -450,6 +453,49 @@ def make_link(cfg):
 
 # -------------------------------------------------------------- sender
 
+class SleepInhibitor:
+    """Holds a logind "sleep" and "idle" block lock while input goes to the PC, so the laptop
+    does not suspend (and then need the power button) during a long session on the PC.
+    The lock lives as long as the `systemd-inhibit` child. The lid switch is not affected."""
+    CMD = ["systemd-inhibit", "--what=sleep:idle", "--who=tpkbd", "--mode=block",
+           "--why=forwarding the keyboard to the PC", "sleep", "infinity"]
+
+    def __init__(self, enabled, cmd=None):
+        self.enabled = enabled
+        self.cmd = cmd or self.CMD
+        self.proc = None
+        self.warn = RateLimited()
+
+    @property
+    def held(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def hold(self):
+        """Take the lock, or take it again if the child died."""
+        if not self.enabled or self.held:
+            return
+        if self.proc is not None and self.warn.ok():
+            log(f"the sleep lock ended (exit {self.proc.returncode}); taking it again")
+        try:
+            self.proc = subprocess.Popen(self.cmd, stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as err:
+            self.proc = None
+            if self.warn.ok():
+                log(f"cannot keep the laptop awake ({err}); set inhibit_sleep = no to silence this")
+
+    def release(self):
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
 class Sender:
     def __init__(self, cfg, soft=False, link=None):
         self.cfg = cfg
@@ -469,6 +515,7 @@ class Sender:
         self.batch = []
         self.next_hb = 0.0
         self.warn = RateLimited()
+        self.inhibitor = SleepInhibitor(soft and cfg["inhibit_sleep"])
 
     # devices
 
@@ -588,6 +635,7 @@ class Sender:
         self.buttons.clear()
         self.batch.clear()
         self.set_state("remote")
+        self.inhibitor.hold()
 
     def leave_remote(self):
         self.link.send(release_lines(self.forwarded, self.buttons, now_us()) +
@@ -597,6 +645,7 @@ class Sender:
         self.batch.clear()
         self.stop_libinput()
         self._ungrab_all()
+        self.inhibitor.release()
         self.set_state("local")
 
     def request_toggle(self):
@@ -675,6 +724,8 @@ class Sender:
         if now >= self.next_hb:
             self.link.send([f"h {now_us()}"])
             self.next_hb = now + self.cfg["heartbeat_s"]
+            if self.state == "remote":
+                self.inhibitor.hold()       # a no-op unless the lock was lost
 
     # main loop
 
@@ -728,6 +779,7 @@ class Sender:
             self.link.send(release_lines(self.forwarded, self.buttons, now_us()))
         self.stop_libinput()
         self._ungrab_all()
+        self.inhibitor.release()
         if self.link is not None:
             self.link.close()
         if self.soft:
