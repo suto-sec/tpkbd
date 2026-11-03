@@ -56,7 +56,7 @@ Run the tests from this folder: `python3 -m unittest discover -s tests -t .` (th
 | Wi-Fi link | Written and unit-tested; the wire was used in practice |
 | Media keys, horizontal scroll, pinch as Ctrl+wheel | Written and unit-tested; **not yet tried on hardware** |
 | Booting the ThinkPad into keyboard mode from GRUB | Documented, not yet tried |
-| Typing in a real BIOS or GRUB menu on the target | **Not tested yet**: the point of v2, and the next check |
+| Typing in a real BIOS on the target over the wire | Verified on real hardware, with the earlier gadget (GRUB not tried) |
 | Pointer speed (`scale`) tuned for a real USB mouse | Default 1.0, not tuned |
 
 ## Limits
@@ -65,5 +65,12 @@ Run the tests from this folder: `python3 -m unittest discover -s tests -t .` (th
 - A plain USB mouse can't do real pinch gestures: pinch becomes Ctrl + wheel.
 - The Pi must stay powered (PWR IN) and takes 20-30 s to boot. A microcontroller board such as a Raspberry Pi Pico boots instantly and would catch early key presses; a possible later port.
 - The wire is unauthenticated. Keep it short and private.
+
+## Planned, not built
+
+- **Clipboard sharing in soft mode.** A plain USB keyboard has no way back from the target, so the two directions differ:
+  - ThinkPad to target: possible by typing the clipboard text as key presses (a hotkey in soft mode). It would be slow, limited to what the target's keyboard layout can type, and no good for images.
+  - Target to ThinkPad: not possible with a plain keyboard and mouse. It would need a second USB function on the Pi (a serial or storage device) and a small program on the target, which is what v2 avoids.
+- **Pi powered only while the keyboard command runs.** Needs a switch for the Pi's power that the sender controls (a hub with per-port power switching, a switch driven by the adapter's DTR pin, or a smart plug). Pair it with a read-only root filesystem on the Pi.
 
 See [../v1/](../v1/) for the software-only version.
