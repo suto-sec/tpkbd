@@ -19,8 +19,12 @@ case "$1" in
         else tr 'A-Z' 'a-z' <"$TPKBD_SSHD_DIR/10-tpkbd.conf" | grep -v '^#'; fi ;;
 esac
 """
+# `is-enabled UNIT` succeeds for the units listed in $STUB_DIR/enabled-units
 SYSTEMCTL_STUB = """#!/bin/sh
 echo "$*" >>"$STUB_DIR/systemctl.log"
+if [ "$1" = is-enabled ]; then
+    grep -qxF "$2" "$STUB_DIR/enabled-units" 2>/dev/null
+fi
 """
 
 BASE_CONFIG = "dtparam=audio=on\n[pi4]\narm_boost=1\n"
@@ -60,7 +64,9 @@ class Harden(unittest.TestCase):
     def run_script(self, *args, stdin=""):
         env = dict(os.environ, STUB_DIR=self.dir, TPKBD_SKIP_ROOT_CHECK="1",
                    TPKBD_BOOT_CONFIG=self.config, TPKBD_SSHD_DIR=self.sshd_dir,
-                   TPKBD_AUTH_KEYS=self.keys, TPKBD_SSHD=os.path.join(self.dir, "sshd"),
+                   TPKBD_AUTH_KEYS=self.keys,
+                   TPKBD_SYSTEMD_CONF_DIR=os.path.join(self.dir, "system.conf.d"),
+                   TPKBD_STATE_DIR=os.path.join(self.dir, "state"), TPKBD_SSHD=os.path.join(self.dir, "sshd"),
                    TPKBD_SYSTEMCTL=os.path.join(self.dir, "systemctl"))
         return subprocess.run(["sh", SCRIPT, *args], input=stdin, env=env,
                               capture_output=True, text=True)
@@ -180,6 +186,61 @@ class Harden(unittest.TestCase):
         self.run_script("--bluetooth")     # already there: not ours, not tagged
         self.run_script("--undo")
         self.assertIn("dtoverlay=disable-bt", self.read(self.config))
+
+    @property
+    def watchdog(self):
+        return os.path.join(self.dir, "system.conf.d", "10-tpkbd-watchdog.conf")
+
+    def test_watchdog_writes_the_systemd_setting(self):
+        r = self.run_script("--watchdog")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("RuntimeWatchdogSec=15", self.read(self.watchdog))
+        self.assertIn("daemon-reexec", self.systemctl_log())
+        self.assertEqual(self.read(self.config), BASE_CONFIG)       # nothing else touched
+        self.assertFalse(os.path.exists(self.dropin))
+
+    def test_fast_boot_disables_only_enabled_units(self):
+        self.write(os.path.join(self.dir, "enabled-units"), "apt-daily.timer\navahi-daemon.service\n")
+        r = self.run_script("--fast-boot")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        log = self.systemctl_log()
+        self.assertIn("disable --now apt-daily.timer", log)
+        self.assertIn("disable --now avahi-daemon.service", log)
+        self.assertNotIn("disable --now man-db.timer", log)
+        text = self.read(self.config)
+        self.assertIn("disable_splash=1", text)
+        self.assertIn("boot_delay=0", text)
+        self.assertEqual(text.count("[all]"), 1)
+
+    def test_fast_boot_never_touches_the_wire_services(self):
+        everything = "\n".join(["tpkbd-recv.service", "tpkbd-gadget.service", "ssh.service",
+                                "serial-getty@ttyS0.service", "apt-daily.timer"])
+        self.write(os.path.join(self.dir, "enabled-units"), everything + "\n")
+        self.run_script("--fast-boot")
+        log = self.systemctl_log()
+        for keep in ("tpkbd", "ssh", "getty"):
+            self.assertNotIn(f"disable --now {keep}", log)
+            self.assertNotIn(keep, "".join(l for l in log.splitlines() if l.startswith("disable")))
+
+    def test_undo_brings_back_watchdog_and_services(self):
+        self.write(os.path.join(self.dir, "enabled-units"), "apt-daily.timer\n")
+        self.run_script("--watchdog")
+        self.run_script("--fast-boot")
+        r = self.run_script("--undo")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(os.path.exists(self.watchdog))
+        self.assertIn("enable apt-daily.timer", self.systemctl_log())
+        text = self.read(self.config)
+        self.assertNotIn("disable_splash", text)
+        self.assertNotIn("boot_delay", text)
+
+    def test_undo_does_not_enable_what_we_never_disabled(self):
+        self.run_script("--undo")
+        self.assertNotIn("enable ", self.systemctl_log())
+
+    def test_watchdog_and_fast_boot_cannot_join_wifi_off(self):
+        for other in ("--watchdog", "--fast-boot"):
+            self.assertEqual(self.run_script("--wifi-off", other, stdin="yes\n").returncode, 2)
 
     def test_undo_with_nothing_to_undo(self):
         r = self.run_script("--undo")

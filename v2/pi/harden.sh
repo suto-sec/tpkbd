@@ -5,10 +5,12 @@
 #   sudo ./harden.sh --bluetooth   only Bluetooth off
 #   sudo ./harden.sh --ssh         only key-only SSH
 #   sudo ./harden.sh --wifi-off    Wi-Fi off. Alone, and last: it cuts SSH over Wi-Fi
+#   sudo ./harden.sh --watchdog    reboot the Pi by itself if it hangs (hardware watchdog)
+#   sudo ./harden.sh --fast-boot   switch off boot-time services the keyboard does not need
 #   sudo ./harden.sh --undo        put all of it back
 #
 # Bluetooth and Wi-Fi are switched off with dtoverlay lines in config.txt, so they take
-# effect at the next reboot. Details and the order to do things in: v2/docs/hardening.md
+# effect at the next reboot (so do --watchdog and --fast-boot). Details and the order to do things in: v2/docs/hardening.md
 set -eu
 
 # overrides, for the tests
@@ -17,29 +19,39 @@ sshd_dir=${TPKBD_SSHD_DIR:-/etc/ssh/sshd_config.d}
 auth_keys=${TPKBD_AUTH_KEYS:-}
 sshd=${TPKBD_SSHD:-sshd}
 systemctl=${TPKBD_SYSTEMCTL:-systemctl}
+systemd_conf_dir=${TPKBD_SYSTEMD_CONF_DIR:-/etc/systemd/system.conf.d}
+state_dir=${TPKBD_STATE_DIR:-/var/lib/tpkbd}
 
 dropin="$sshd_dir/10-tpkbd.conf"
+watchdog_conf="$systemd_conf_dir/10-tpkbd-watchdog.conf"
+disabled_list="$state_dir/harden-disabled-units"
+# services the keyboard does not need; ones that are not installed or not enabled are skipped
+boot_units="apt-daily.timer apt-daily-upgrade.timer man-db.timer e2scrub_all.timer fstrim.timer
+    triggerhappy.service avahi-daemon.service ModemManager.service dphys-swapfile.service
+    rpi-eeprom-update.service NetworkManager-wait-online.service systemd-networkd-wait-online.service"
 tag="# tpkbd harden.sh"
 
-do_bt=0 do_ssh=0 do_wifi=0 do_undo=0
+do_bt=0 do_ssh=0 do_wifi=0 do_undo=0 do_wd=0 do_fast=0
 for arg in "$@"; do
     case $arg in
         --bluetooth) do_bt=1 ;;
         --ssh) do_ssh=1 ;;
         --wifi-off) do_wifi=1 ;;
         --undo) do_undo=1 ;;
-        -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+        --watchdog) do_wd=1 ;;
+        --fast-boot) do_fast=1 ;;
+        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
         *) echo "unknown option: $arg (see $0 --help)" >&2; exit 2 ;;
     esac
 done
-if [ $((do_bt + do_ssh + do_wifi + do_undo)) -eq 0 ]; then
+if [ $((do_bt + do_ssh + do_wifi + do_undo + do_wd + do_fast)) -eq 0 ]; then
     do_bt=1 do_ssh=1
 fi
-if [ "$do_wifi" -eq 1 ] && [ $((do_bt + do_ssh + do_undo)) -gt 0 ]; then
+if [ "$do_wifi" -eq 1 ] && [ $((do_bt + do_ssh + do_undo + do_wd + do_fast)) -gt 0 ]; then
     echo "--wifi-off goes on its own, as the very last step: it cuts SSH over Wi-Fi." >&2
     exit 2
 fi
-if [ "$do_undo" -eq 1 ] && [ $((do_bt + do_ssh)) -gt 0 ]; then
+if [ "$do_undo" -eq 1 ] && [ $((do_bt + do_ssh + do_wd + do_fast)) -gt 0 ]; then
     echo "--undo goes on its own." >&2
     exit 2
 fi
@@ -145,8 +157,59 @@ undo_ssh() {
     fi
 }
 
+enable_watchdog() {
+    install -d -m 755 "$systemd_conf_dir"
+    cat >"$watchdog_conf" <<'EOF'
+# written by tpkbd harden.sh; remove with: sudo ./harden.sh --undo
+[Manager]
+RuntimeWatchdogSec=15
+RebootWatchdogSec=2min
+EOF
+    chmod 644 "$watchdog_conf"
+    "$systemctl" daemon-reexec 2>/dev/null || true
+    echo "watchdog: systemd now feeds the hardware watchdog; a hung Pi reboots after about 15 s"
+}
+
+undo_watchdog() {
+    if [ -f "$watchdog_conf" ]; then
+        rm -f "$watchdog_conf"
+        "$systemctl" daemon-reexec 2>/dev/null || true
+        echo "watchdog: removed $watchdog_conf"
+    else
+        echo "watchdog: nothing of ours to remove"
+    fi
+}
+
+fast_boot() {
+    install -d -m 755 "$state_dir"
+    for unit in $boot_units; do
+        "$systemctl" is-enabled "$unit" >/dev/null 2>&1 || continue
+        if "$systemctl" disable --now "$unit" >/dev/null 2>&1; then
+            grep -qxF "$unit" "$disabled_list" 2>/dev/null || echo "$unit" >>"$disabled_list"
+            echo "boot: disabled $unit"
+        fi
+    done
+    add_overlay disable_splash=1 "no rainbow splash"
+    add_overlay boot_delay=0 "no boot delay"
+    echo "Reboot, then compare 'systemd-analyze' with the number you noted before."
+}
+
+undo_fast_boot() {
+    if [ -f "$disabled_list" ]; then
+        while read -r unit; do
+            [ -z "$unit" ] || "$systemctl" enable "$unit" >/dev/null 2>&1 || true
+        done <"$disabled_list"
+        rm -f "$disabled_list"
+        echo "boot: re-enabled the services we disabled (they start at the next boot)"
+    else
+        echo "boot: no services of ours to re-enable"
+    fi
+}
+
 if [ "$do_undo" -eq 1 ]; then
     undo_ssh
+    undo_watchdog
+    undo_fast_boot
     remove_overlays
     echo "Reboot to bring Bluetooth and Wi-Fi back."
     exit 0
@@ -175,3 +238,5 @@ fi
     echo "Reboot for Bluetooth to go off. /dev/serial0 then points at the full UART, which the wire uses."
 }
 [ "$do_ssh" -eq 0 ] || harden_ssh
+[ "$do_wd" -eq 0 ] || enable_watchdog
+[ "$do_fast" -eq 0 ] || fast_boot

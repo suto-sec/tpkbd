@@ -7,7 +7,7 @@ Once the wired link works, the Pi does not need Bluetooth, password logins or (e
 Do these in order, and stop at any point:
 
 1. Everything works: typing, media keys, pinch, and `tpkbd-hid test-scroll` ([pi-setup.md](pi-setup.md)). Settle `recv.conf` (`scroll`, `led`, `scale`).
-2. `sudo ./harden.sh`: Bluetooth off and key-only SSH.
+2. `sudo ./harden.sh`: Bluetooth off and key-only SSH. Optionally `--watchdog` and `--fast-boot` too (`systemd-analyze` first, to compare).
 3. `sudo ./harden.sh --wifi-off`: last, on its own.
 4. Read-only root filesystem ([below](#read-only-root-filesystem)): the very last step, because it discards later edits.
 
@@ -19,7 +19,9 @@ Do these in order, and stop at any point:
 | `--bluetooth` | Adds `dtoverlay=disable-bt` to `config.txt` and disables `hciuart`. Takes effect at the next reboot. `/dev/serial0` then points at the full UART, which is what the wire uses |
 | `--ssh` | Writes `/etc/ssh/sshd_config.d/10-tpkbd.conf` (no password or keyboard-interactive logins, keys only) and reloads sshd |
 | `--wifi-off` | Adds `dtoverlay=disable-wifi`. Asks you to type `yes`, and refuses to be combined with other flags |
-| `--undo` | Removes the drop-in and our `config.txt` lines |
+| `--watchdog` | Writes `/etc/systemd/system.conf.d/10-tpkbd-watchdog.conf` (`RuntimeWatchdogSec=15`): systemd feeds the Pi's hardware watchdog, so a Pi that hangs reboots itself in about 15 s instead of staying dead until you cut its power. Not part of the no-flag default |
+| `--fast-boot` | Disables boot-time services the keyboard does not need (apt and man-db timers, avahi, ModemManager, swap file, EEPROM updater, the wait-online services; only those that exist and are enabled) and adds `disable_splash=1` and `boot_delay=0` to `config.txt`. Note `systemd-analyze` before and after: the gain is unmeasured. The services it disabled are listed in `/var/lib/tpkbd/harden-disabled-units`. Not part of the no-flag default |
+| `--undo` | Removes the drop-ins, re-enables the services `--fast-boot` disabled, and removes our `config.txt` lines |
 
 Safety nets:
 
