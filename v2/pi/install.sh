@@ -46,6 +46,7 @@ if [ -n "$user" ] && [ "$user" != root ]; then
 fi
 
 udevadm control --reload
+udevadm trigger --subsystem-match=leds --action=add || true
 systemctl daemon-reload
 systemctl enable tpkbd-gadget.service tpkbd-recv.service
 # restarting the gadget also restarts tpkbd-recv (PartOf=), so it reopens /dev/hidg* and runs the new code

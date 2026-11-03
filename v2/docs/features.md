@@ -24,10 +24,20 @@ On the Pi, `/etc/tpkbd/recv.conf` (the UART service) or `~/.config/tpkbd/recv.co
 |---|---|---|
 | `scale` | `1.0` | Pointer speed multiplier |
 | `pinch_clicks` | `6` | Ctrl+wheel clicks per doubling of the pinch distance |
+| `led` | `activity` | The Pi's green LED: `off`, `on`, or `activity` (lit while input is being forwarded). See "Lights" below |
 | `watchdog_s` | `3` | Silence this long: release every key and button |
 | `dead_s` | `30` | SSH link only: silence this long, the sender is gone, exit |
 
 On the ThinkPad, `/etc/tpkbd/tpkbd.conf` (`link`, `serial_port`, `baud`, the device names, `block_keys`, `escape_keys`, `toggle_keys`), from `v1/thinkpad/tpkbd.conf.example`.
+
+## Lights
+
+| Light | Can software change it? |
+|---|---|
+| Pi green LED | Yes: `led = off`, `on` or `activity` in `recv.conf`, then `sudo systemctl restart tpkbd-recv`. It still blinks while the Pi boots, before the service starts. The LED goes back to its normal SD-card blinking when the service stops. |
+| CP2102 power LED and TX/RX LED | No: they are wired on the adapter's board. Cover them with tape or nail polish, or desolder them. |
+
+The Zero 2 W has only the one green LED and no separate power LED. If `journalctl -u tpkbd-recv` says it cannot control the LED, run `pi/install.sh` again and reboot (it installs the rule that lets the service write to the LED).
 
 ## Safety behaviour
 

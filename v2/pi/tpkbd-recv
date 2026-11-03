@@ -10,7 +10,8 @@ gadget made by tpkbd-hid.
                                (pi/tpkbd-recv.service). Answers `hello` with READY
                                and every heartbeat with `ok`.
 
-Settings (optional): ~/.config/tpkbd/recv.conf or --config, see pi/recv.conf.example.
+Settings (optional): ~/.config/tpkbd/recv.conf or --config, see pi/recv.conf.example
+(pointer speed, pinch, timeouts and what the Pi's green LED does).
 Standard library only.
 """
 import argparse
@@ -19,6 +20,7 @@ import importlib.machinery
 import importlib.util
 import math
 import os
+import re
 import select
 import sys
 import termios
@@ -33,6 +35,11 @@ DEFAULTS = {
     "watchdog_s": "3",      # silence this long: release every key and button
     "dead_s": "30",         # silence this long: the sender is gone, exit
 }
+
+LED_MODES = ("off", "on", "activity")
+LED_DEFAULT = "activity"
+LED_DIRS = ("/sys/class/leds/ACT", "/sys/class/leds/led0")  # new and old kernel names
+LED_FLASH_S = 0.08          # how long the LED stays lit after input in "activity" mode
 
 EV_SYN, EV_KEY = 0, 1
 WHEEL_UNITS = 15            # libinput: 15 scroll units per wheel click
@@ -67,15 +74,88 @@ def load_config(path=CONF_PATH):
     cp.read_dict({"receiver": DEFAULTS})
     cp.read(path)  # a missing file just means defaults
     s = cp["receiver"]
-    return {k: float(s[k]) for k in DEFAULTS}
+    cfg = {k: float(s[k]) for k in DEFAULTS}
+    cfg["led"] = s.get("led", LED_DEFAULT).strip().lower()
+    if cfg["led"] not in LED_MODES:
+        raise ValueError(f"led must be one of {', '.join(LED_MODES)}, not {cfg['led']!r}")
+    return cfg
+
+
+class Led:
+    """The Pi's green LED: always off, always on, or lit while input is being forwarded.
+
+    Needs write access to the LED's sysfs files (pi/60-tpkbd-hid.rules grants it to the
+    tpkbd group). Without a LED or without access it only says so once and does nothing."""
+
+    def __init__(self, mode, dirs=LED_DIRS):
+        self.mode = mode
+        self.dir = next((d for d in dirs if os.path.isdir(d)), None)
+        self.lit = None             # unknown until the first write
+        self.until = 0.0            # "activity": switch off at this monotonic time
+        self.saved = None           # the trigger the kernel had set, put back on close
+        if self.dir is None:
+            say("no ACT LED found: the led setting is ignored")
+            return
+        try:
+            self.saved = self._selected_trigger()
+            self._write("trigger", "none")
+            self._set(mode == "on")
+        except OSError as err:
+            say(f"cannot control the LED ({err}): re-run pi/install.sh and reboot")
+            self.dir = None
+
+    def _write(self, name, value):
+        with open(os.path.join(self.dir, name), "w") as f:
+            f.write(value)
+
+    def _selected_trigger(self):
+        with open(os.path.join(self.dir, "trigger")) as f:
+            m = re.search(r"\[([^\]]+)\]", f.read())
+        return m.group(1) if m else None
+
+    def _set(self, on):
+        if on != self.lit:
+            self._write("brightness", "1" if on else "0")
+            self.lit = on
+
+    def flash(self, now):
+        """Input was forwarded."""
+        if self.dir is None or self.mode != "activity":
+            return
+        self.until = now + LED_FLASH_S
+        try:
+            self._set(True)
+        except OSError:
+            self.dir = None
+
+    def tick(self, now):
+        if self.dir is not None and self.mode == "activity" and self.lit and now >= self.until:
+            try:
+                self._set(False)
+            except OSError:
+                self.dir = None
+
+    def timeout(self, now, default):
+        """How long serve() may sleep: not past the moment the LED has to go dark."""
+        if self.dir is not None and self.mode == "activity" and self.lit:
+            return min(default, max(0.005, self.until - now))
+        return default
+
+    def close(self):
+        if self.dir is not None and self.saved:
+            try:
+                self._write("trigger", self.saved)
+            except OSError:
+                pass
 
 
 class Replayer:
     """Protocol lines in, HID reports out. A host that isn't reading is not an error."""
 
-    def __init__(self, kbd_out, mouse_out, cfg, reply=None, consumer_out=None):
+    def __init__(self, kbd_out, mouse_out, cfg, reply=None, consumer_out=None, led=None):
         self.kbd_out, self.mouse_out = kbd_out, mouse_out
         self.consumer_out = consumer_out    # media keys; None if the gadget predates them
+        self.led = led              # Led or None
         self.reply = reply          # writes a line back to the sender (serial mode only)
         self.scale = cfg["scale"]
         self.pinch_clicks = cfg.get("pinch_clicks", 6.0)
@@ -113,6 +193,8 @@ class Replayer:
                 return
         if len(p) != 4 or p[0] not in ("k", "m", "b", "s", "g"):
             return  # includes the "h" heartbeat: it only matters that it arrived
+        if self.led is not None:
+            self.led.flash(time.monotonic())
         try:
             self._dispatch(p)
         except (ValueError, OSError) as err:
@@ -204,12 +286,17 @@ def serve(rp, fd, watchdog_s, dead_s):
     last = time.monotonic()
     released = True  # nothing pressed yet
     while True:
+        wait = min(0.5, max(0.01, watchdog_s / 4))
+        if rp.led is not None:
+            wait = rp.led.timeout(time.monotonic(), wait)
         try:
-            r, _, _ = select.select([fd], [], [], min(0.5, max(0.01, watchdog_s / 4)))
+            r, _, _ = select.select([fd], [], [], wait)
         except OSError as err:
             say(f"port failed: {err}")
             break
         now = time.monotonic()
+        if rp.led is not None:
+            rp.led.tick(now)
         if r:
             try:
                 data = os.read(fd, 65536)
@@ -272,7 +359,10 @@ def main():
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--config", default=CONF_PATH)
     args = ap.parse_args()
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+    except ValueError as err:
+        sys.exit(f"tpkbd-recv: bad setting in {args.config}: {err}")
     try:
         kbd_out = hid.HidOut.open("/dev/hidg0")
         mouse_out = hid.HidOut.open("/dev/hidg1")
@@ -283,15 +373,19 @@ def main():
     except hid.HidError:
         consumer_out = None
         say("no /dev/hidg2: media keys are off until the gadget is recreated (re-run pi/install.sh, reboot)")
-    if args.serial:
-        fd = open_serial(args.serial, args.baud)
-        say(f"listening on {args.serial} at {args.baud} baud")
-        serve(Replayer(kbd_out, mouse_out, cfg, reply=serial_reply(fd), consumer_out=consumer_out),
-              fd, cfg["watchdog_s"], 0)
-        return
-    print(f"READY {PROTO}", flush=True)
-    serve(Replayer(kbd_out, mouse_out, cfg, consumer_out=consumer_out),
-          0, cfg["watchdog_s"], cfg["dead_s"])
+    led = Led(cfg["led"])
+    try:
+        if args.serial:
+            fd = open_serial(args.serial, args.baud)
+            say(f"listening on {args.serial} at {args.baud} baud")
+            serve(Replayer(kbd_out, mouse_out, cfg, reply=serial_reply(fd),
+                           consumer_out=consumer_out, led=led), fd, cfg["watchdog_s"], 0)
+            return
+        print(f"READY {PROTO}", flush=True)
+        serve(Replayer(kbd_out, mouse_out, cfg, consumer_out=consumer_out, led=led),
+              0, cfg["watchdog_s"], cfg["dead_s"])
+    finally:
+        led.close()
 
 
 if __name__ == "__main__":

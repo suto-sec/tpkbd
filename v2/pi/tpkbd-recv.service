@@ -21,7 +21,7 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ProtectKernelModules=yes
-ProtectKernelTunables=yes
+# (no ProtectKernelTunables: it would make /sys read-only and the LED setting could not work)
 ProtectControlGroups=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

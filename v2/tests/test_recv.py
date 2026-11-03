@@ -338,7 +338,8 @@ class Gone(unittest.TestCase):
 class Config(unittest.TestCase):
     def test_defaults_without_a_file(self):
         cfg = recv.load_config("/nonexistent/recv.conf")
-        self.assertEqual(cfg, {"scale": 1.0, "pinch_clicks": 6.0, "watchdog_s": 3.0, "dead_s": 30.0})
+        self.assertEqual(cfg, {"scale": 1.0, "pinch_clicks": 6.0, "watchdog_s": 3.0, "dead_s": 30.0,
+                               "led": "activity"})
 
     def test_override(self):
         with tempfile.TemporaryDirectory() as d:
@@ -390,6 +391,128 @@ class Serve(unittest.TestCase):
                 os.close(w)
         # released once by the watchdog, once on the way out
         self.assertEqual(kbd.reports.count(bytes(8)), 2)
+
+
+class FakeLedDir:
+    """A pretend /sys/class/leds/ACT in a temp directory."""
+
+    def __init__(self, trigger="none [mmc0] heartbeat"):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = self.tmp.name
+        self.put("trigger", trigger)
+        self.put("brightness", "0")
+
+    def put(self, name, text):
+        with open(os.path.join(self.path, name), "w") as f:
+            f.write(text)
+
+    def get(self, name):
+        with open(os.path.join(self.path, name)) as f:
+            return f.read()
+
+
+class LedSetting(unittest.TestCase):
+    def setUp(self):
+        self.d = FakeLedDir()
+        self.addCleanup(self.d.tmp.cleanup)
+        patch = mock.patch.object(recv, "say")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def led(self, mode):
+        return recv.Led(mode, dirs=(self.d.path,))
+
+    def test_config_default_and_override(self):
+        with tempfile.TemporaryDirectory() as t:
+            path = os.path.join(t, "recv.conf")
+            with open(path, "w") as f:
+                f.write("[receiver]\nled = OFF\n")
+            self.assertEqual(recv.load_config(path)["led"], "off")
+
+    def test_config_rejects_unknown_mode(self):
+        with tempfile.TemporaryDirectory() as t:
+            path = os.path.join(t, "recv.conf")
+            with open(path, "w") as f:
+                f.write("[receiver]\nled = blink\n")
+            with self.assertRaises(ValueError):
+                recv.load_config(path)
+
+    def test_off_and_on_take_over_the_led(self):
+        self.led("on")
+        self.assertEqual((self.d.get("trigger"), self.d.get("brightness")), ("none", "1"))
+        self.led("off")
+        self.assertEqual(self.d.get("brightness"), "0")
+
+    def test_close_gives_the_led_back(self):
+        led = self.led("off")
+        led.close()
+        self.assertEqual(self.d.get("trigger"), "mmc0")
+
+    def test_activity_lights_on_input_then_goes_dark(self):
+        led = self.led("activity")
+        self.assertEqual(self.d.get("brightness"), "0")
+        led.flash(100.0)
+        self.assertEqual(self.d.get("brightness"), "1")
+        led.tick(100.0 + recv.LED_FLASH_S / 2)
+        self.assertEqual(self.d.get("brightness"), "1")
+        led.tick(100.0 + recv.LED_FLASH_S + 0.01)
+        self.assertEqual(self.d.get("brightness"), "0")
+
+    def test_activity_extends_while_input_continues(self):
+        led = self.led("activity")
+        led.flash(100.0)
+        led.flash(100.05)
+        led.tick(100.0 + recv.LED_FLASH_S + 0.01)   # first flash would be over, second is not
+        self.assertEqual(self.d.get("brightness"), "1")
+
+    def test_off_and_on_ignore_input(self):
+        led = self.led("off")
+        led.flash(1.0)
+        self.assertEqual(self.d.get("brightness"), "0")
+
+    def test_serve_may_sleep_only_until_the_led_must_go_dark(self):
+        led = self.led("activity")
+        self.assertEqual(led.timeout(5.0, 0.5), 0.5)
+        led.flash(5.0)
+        self.assertAlmostEqual(led.timeout(5.0, 0.5), recv.LED_FLASH_S)
+
+    def test_no_led_is_not_an_error(self):
+        led = recv.Led("activity", dirs=("/nonexistent/led",))
+        led.flash(1.0)
+        led.tick(5.0)
+        led.close()
+        self.assertEqual(led.timeout(1.0, 0.5), 0.5)
+
+    def test_no_permission_is_not_an_error(self):
+        os.remove(os.path.join(self.d.path, "trigger"))     # reading it fails
+        led = self.led("on")
+        led.flash(1.0)
+        self.assertIsNone(led.dir)
+
+    def test_input_lines_flash_but_heartbeats_do_not(self):
+        led = self.led("activity")
+        rp = recv.Replayer(FakeOut(), FakeOut(), CFG, led=led)
+        rp.handle("h 1")
+        self.assertEqual(self.d.get("brightness"), "0")
+        rp.handle("m 3 4 1")
+        self.assertEqual(self.d.get("brightness"), "1")
+
+    def test_serve_turns_the_led_off_after_the_input_stops(self):
+        led = self.led("activity")
+        rp = recv.Replayer(FakeOut(), FakeOut(), CFG, led=led)
+        r, w = os.pipe()
+        t = threading.Thread(target=recv.serve, args=(rp, r, 5.0, 0))
+        t.start()
+        try:
+            os.write(w, b"m 3 4 1\n")
+            time.sleep(0.05)
+            self.assertEqual(self.d.get("brightness"), "1")
+            time.sleep(0.4)
+            self.assertEqual(self.d.get("brightness"), "0")
+        finally:
+            os.close(w)     # EOF ends serve()
+            t.join(5)
+            os.close(r)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,10 @@
 # Ctrl+wheel clicks per doubling of the pinch distance (a pinch becomes Ctrl + wheel)
 # pinch_clicks = 6
 
+# the Pi's green LED: off, on, or activity (lit while input is being forwarded).
+# It still blinks during boot, before this service starts
+# led = activity
+
 # no data for this many seconds: release every key and button
 # watchdog_s = 3
 # no data for this many seconds: the sender is gone, exit

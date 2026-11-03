@@ -1,2 +1,4 @@
 # let members of the tpkbd group write HID reports without root
 KERNEL=="hidg[0-9]*", GROUP="tpkbd", MODE="0660"
+# ... and the green LED, so the led setting in recv.conf works (ACT on new kernels, led0 on old)
+SUBSYSTEM=="leds", KERNEL=="ACT|led0", RUN+="/bin/chgrp tpkbd /sys%p/brightness /sys%p/trigger", RUN+="/bin/chmod g+w /sys%p/brightness /sys%p/trigger"
