@@ -83,7 +83,7 @@ The sender says in words what is wrong. It tells three problems apart: the adapt
 
 When the link is up but the PC's USB is not, keyboard mode still takes over the keyboard and warns you (hold Left Ctrl + Right Ctrl + Esc to get it back); the keys just do not reach the PC until the PC's USB comes up. The same `PC USB problem` text is shown in `systemctl status tpkbd-forward`.
 
-If the symptoms are vague: swap the TX and RX wires, check GND is on pin 6, and run the loopback test. Connects-then-drops is usually a loose jumper or a long, poor USB extension to the adapter.
+If the symptoms are vague: swap the TX and RX wires, check GND is on pin 6, and run the loopback test. Connects-then-drops is usually a loose jumper or a long, poor USB extension to the adapter. Also push the adapter all the way into the laptop's USB port: a half-seated one can fail to enumerate or drop out, and keyboard mode then sits at the login screen with the panel still on.
 
 ## Speed
 
