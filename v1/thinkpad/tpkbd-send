@@ -336,7 +336,7 @@ def open_serial(path, baud):
     except OSError as err:
         hint = ""
         if err.errno == errno.ENOENT:
-            hint = (": the USB-serial adapter is not detected by this laptop. Replug it, and check "
+            hint = (": the USB-serial adapter is not detected by this laptop. Replug it all the way in (a lit adapter can still be half-seated), and check "
                     "that `lsusb` lists it (a CP2102 is 10c4:ea60) and `ls /dev/ttyUSB*` shows the port")
         elif err.errno == errno.EACCES:
             hint = ": no permission; the tpkbd user must be in the uucp (Arch) or dialout group"

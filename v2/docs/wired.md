@@ -70,7 +70,7 @@ The sender says in words what is wrong. It tells three problems apart: the adapt
 
 | Message (from `journalctl -u tpkbd-forward` or the terminal) | Meaning and fix |
 |---|---|
-| `USB-serial adapter is not detected` | No `/dev/ttyUSB0`. Replug the CP2102 (after a BIOS change it may not enumerate until replugged); `lsusb` should list `10c4:ea60`. |
+| `USB-serial adapter is not detected` | No `/dev/ttyUSB0`. Replug the CP2102 and push it fully in: its light can be on while it is half-seated and still undetected (after a BIOS change it may not enumerate until replugged). `lsusb` should list `10c4:ea60`. |
 | `tpkbd user must be in the uucp/dialout group` | No permission on the adapter: add the service user to that group. |
 | `went away while waiting: the USB-serial adapter was unplugged or failed` | The adapter vanished during the wait. |
 | `the Pi did not answer` | Nothing came back. The Pi is still booting (about 30 s after the PC starts), unpowered (is the PC on?), TX/RX are swapped or loose, or `tpkbd-recv` is down (`systemctl status tpkbd-recv` on the Pi). |
@@ -83,7 +83,7 @@ The sender says in words what is wrong. It tells three problems apart: the adapt
 
 When the link is up but the PC's USB is not, keyboard mode still takes over the keyboard and warns you (hold Left Ctrl + Right Ctrl + Esc to get it back); the keys just do not reach the PC until the PC's USB comes up. The same `PC USB problem` text is shown in `systemctl status tpkbd-forward`.
 
-If the symptoms are vague: swap the TX and RX wires, check GND is on pin 6, and run the loopback test. Connects-then-drops is usually a loose jumper or a long, poor USB extension to the adapter. Also push the adapter all the way into the laptop's USB port: a half-seated one can fail to enumerate or drop out, and keyboard mode then sits at the login screen with the panel still on.
+If the symptoms are vague: swap the TX and RX wires, check GND is on pin 6, and run the loopback test. Connects-then-drops is usually a loose jumper or a long, poor USB extension to the adapter. Also push the adapter all the way into the laptop's USB port. A half-seated one can have its power light on (the power pins touch first) while the data pins do not, so the laptop never detects it: no `/dev/ttyUSB0`, and keyboard mode sits at the login screen with the panel still on. A lit adapter does not mean the laptop sees it; check `lsusb`.
 
 ## Speed
 
