@@ -73,7 +73,7 @@ The sender says in words what is wrong. It tells three problems apart: the adapt
 | `USB-serial adapter is not detected` | No `/dev/ttyUSB0`. Replug the CP2102 and push it fully in: its light can be on while it is half-seated and still undetected (after a BIOS change it may not enumerate until replugged). `lsusb` should list `10c4:ea60`. |
 | `tpkbd user must be in the uucp/dialout group` | No permission on the adapter: add the service user to that group. |
 | `went away while waiting: the USB-serial adapter was unplugged or failed` | The adapter vanished during the wait. |
-| `the Pi did not answer` | Nothing came back. The Pi is still booting (about 30 s after the PC starts), unpowered (is the PC on?), TX/RX are swapped or loose, or `tpkbd-recv` is down (`systemctl status tpkbd-recv` on the Pi). |
+| `the Pi did not answer` | Nothing came back. Check the wires first: with the adapter and the Pi both powered, wrong or swapped jumpers (adapter TX to Pi RX, adapter RX to Pi TX, GND to GND, see Wiring) look exactly like a dead Pi. Otherwise the Pi is still booting (about 30 s after the PC starts), unpowered (is the PC on?), or `tpkbd-recv` is down (`systemctl status tpkbd-recv` on the Pi). An older installed sender only prints `PC not reachable or receiver not ready` for all of these: re-run `thinkpad/install.sh` after updating. |
 | `receives data but no READY` | Bytes arrive but not the handshake: wrong baud rate, a noisy wire, or another program on the Pi's serial port. |
 | `PC USB problem: the PC is asleep` | The Pi is fine, the PC suspended its USB. Wake the PC. |
 | `PC USB problem: the Pi's USB gets no link from the PC` | The Pi is fine, its data cable is unplugged or bad, or the PC is off. |
