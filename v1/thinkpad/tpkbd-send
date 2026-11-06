@@ -94,7 +94,16 @@ def key_codes(text):
 def load_config(path=CONF_PATH):
     cp = configparser.ConfigParser(interpolation=None)
     cp.read_dict({"sender": DEFAULTS})
-    cp.read(path)  # a missing file just means defaults
+    # a missing file just means defaults, but one we cannot read must not: ConfigParser.read
+    # would skip it silently, and a serial setup would fall back to ssh
+    try:
+        with open(path) as f:
+            cp.read_file(f)
+    except FileNotFoundError:
+        pass
+    except OSError as err:
+        raise ValueError(f"cannot read it ({err.strerror}); the service user tpkbd must own it, "
+                         "run: sudo chown -R tpkbd:tpkbd /etc/tpkbd") from err
     s = cp["sender"]
     if s["link"] not in ("ssh", "serial"):
         raise ValueError(f"link must be ssh or serial, not {s['link']!r}")

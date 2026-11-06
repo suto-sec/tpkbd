@@ -118,6 +118,16 @@ class Config(unittest.TestCase):
         self.assertEqual(cfg["block_keys"], {e.KEY_A})
         self.assertEqual(cfg["heartbeat_s"], 0.25)
 
+    @unittest.skipIf(os.geteuid() == 0, "root reads any file")
+    def test_unreadable_file_is_an_error_not_the_defaults(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".conf") as f:
+            f.write("[sender]\nlink = serial\n")
+            f.flush()
+            os.chmod(f.name, 0)
+            with self.assertRaises(ValueError) as cm:
+                send.load_config(f.name)
+        self.assertIn("chown", str(cm.exception))
+
     def test_unknown_key_name(self):
         with tempfile.NamedTemporaryFile("w", suffix=".conf") as f:
             f.write("[sender]\ntoggle_keys = KEY_NOPE\n")
